@@ -40,13 +40,16 @@ def make_attn_mask(input_mask, mask_ar):
     mask_ar = jnp.broadcast_to(mask_ar, input_mask.shape)
     cumsum = jnp.cumsum(mask_ar, axis=1)
     attn_mask = cumsum[:, None, :] <= cumsum[:, :, None]
+    attn_mask = attn_mask.at[:, -2, -12:-7].set(False)
+    attn_mask = attn_mask.at[:, -2, -1].set(False)
+    attn_mask = attn_mask.at[:, -1, -7:-1].set(False)
     valid_mask = input_mask[:, None, :] * input_mask[:, :, None]
     return jnp.logical_and(attn_mask, valid_mask)
 
 
 @at.typecheck
 def posemb_sincos(
-    pos: at.Real[at.Array, " b"], embedding_dim: int, min_period: float, max_period: float
+        pos: at.Real[at.Array, " b"], embedding_dim: int, min_period: float, max_period: float
 ) -> at.Float[at.Array, "b {embedding_dim}"]:
     """Computes sine-cosine positional embedding vectors for scalar positions."""
     if embedding_dim % 2 != 0:
@@ -104,7 +107,7 @@ class Pi0(_model.BaseModel):
 
     @at.typecheck
     def embed_prefix(
-        self, obs: _model.Observation
+            self, obs: _model.Observation
     ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"]]:
         input_mask = []
         ar_mask = []
@@ -138,7 +141,7 @@ class Pi0(_model.BaseModel):
 
     @at.typecheck
     def embed_suffix(
-        self, obs: _model.Observation, noisy_actions: _model.Actions, timestep: at.Float[at.Array, " b"]
+            self, obs: _model.Observation, noisy_actions: _model.Actions, timestep: at.Float[at.Array, " b"]
     ) -> tuple[
         at.Float[at.Array, "b s emb"],
         at.Bool[at.Array, "b s"],
@@ -169,7 +172,7 @@ class Pi0(_model.BaseModel):
             adarms_cond = time_emb
         else:
             # mix timestep + action information using an MLP (no adaRMS)
-            time_tokens = einops.repeat(time_emb, "b emb -> b s emb", s=self.action_horizon)
+            time_tokens = einops.repeat(time_emb, "b emb -> b s emb", s=self.action_horizon + 2)
             action_time_tokens = jnp.concatenate([action_tokens, time_tokens], axis=-1)
             action_time_tokens = self.action_time_mlp_in(action_time_tokens)
             action_time_tokens = nnx.swish(action_time_tokens)
@@ -179,7 +182,7 @@ class Pi0(_model.BaseModel):
         tokens.append(action_expert_tokens)
         input_mask.append(jnp.ones(action_expert_tokens.shape[:2], dtype=jnp.bool_))
         # image/language/state inputs do not attend to action tokens
-        ar_mask += [True] + ([False] * (self.action_horizon - 1))
+        ar_mask += [True] + ([False] * (self.action_horizon + 1))
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
@@ -187,13 +190,15 @@ class Pi0(_model.BaseModel):
 
     @override
     def compute_loss(
-        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+            self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> at.Float[at.Array, "*b ah"]:
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
 
         batch_shape = actions.shape[:-2]
-        noise = jax.random.normal(noise_rng, actions.shape)
+        noise_shape = (*batch_shape, actions.shape[-2] + 2, actions.shape[-1])
+
+        noise = jax.random.normal(noise_rng, noise_shape)
         time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
         time_expanded = time[..., None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
@@ -209,18 +214,18 @@ class Pi0(_model.BaseModel):
         (prefix_out, suffix_out), _ = self.PaliGemma.llm(
             [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
         )
-        v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+        v_t = self.action_out_proj(suffix_out[:, -self.action_horizon - 2:-2])
 
         return jnp.mean(jnp.square(v_t - u_t), axis=-1)
 
     @override
     def sample_actions(
-        self,
-        rng: at.KeyArrayLike,
-        observation: _model.Observation,
-        *,
-        num_steps: int | at.Int[at.Array, ""] = 10,
-        noise: at.Float[at.Array, "b ah ad"] | None = None,
+            self,
+            rng: at.KeyArrayLike,
+            observation: _model.Observation,
+            *,
+            num_steps: int | at.Int[at.Array, ""] = 10,
+            noise: at.Float[at.Array, "b ah ad"] | None = None,
     ) -> _model.Actions:
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
@@ -228,7 +233,7 @@ class Pi0(_model.BaseModel):
         dt = -1.0 / num_steps
         batch_size = observation.state.shape[0]
         if noise is None:
-            noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
+            noise = jax.random.normal(rng, (batch_size, self.action_horizon + 2, self.action_dim))
 
         # first fill KV cache with a forward pass of the prefix
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
@@ -266,7 +271,7 @@ class Pi0(_model.BaseModel):
                 adarms_cond=[None, adarms_cond],
             )
             assert prefix_out is None
-            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon - 2:-2])
 
             return x_t + dt * v_t, time + dt
 
