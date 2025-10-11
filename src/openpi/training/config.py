@@ -525,6 +525,11 @@ class TrainConfig:
     # data parallel between 2 groups of devices.
     fsdp_devices: int = 1
 
+    # 时间配对采样：是否在同一个batch中加载同一轨迹中相差固定时间步的样本对
+    use_temporal_pairs: bool = False
+    # 时间配对的偏移量（时间步数），默认为5
+    temporal_pair_offset: int = 5
+
     @property
     def assets_dirs(self) -> pathlib.Path:
         """Get the assets directory for this config."""

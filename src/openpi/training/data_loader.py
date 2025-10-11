@@ -19,6 +19,112 @@ import openpi.transforms as _transforms
 T_co = TypeVar("T_co", covariant=True)
 
 
+class TemporalPairSampler(torch.utils.data.Sampler):
+    """采样器：在同一个batch中采样同一轨迹中相差固定时间步的样本对。
+    
+    采样策略：
+    1. 先从有效样本中随机采样 batch_size/2 个样本（作为时刻t）
+    2. 对于每个采样的样本，找到它在轨迹中偏移time_offset后的样本（时刻t+offset）
+    3. 将配对的样本组织成 [t1, t1+offset, t2, t2+offset, ...] 的形式
+    
+    Args:
+        dataset: LeRobotDataset实例
+        batch_size: batch大小，必须是偶数
+        time_offset: 时间偏移量（时间步数），默认为5
+        shuffle: 是否打乱顺序
+        seed: 随机种子
+    """
+    
+    def __init__(
+        self,
+        dataset,
+        batch_size: int,
+        time_offset: int = 5,
+        shuffle: bool = True,
+        seed: int = 0,
+    ):
+        if batch_size % 2 != 0:
+            raise ValueError(f"batch_size必须是偶数，当前为 {batch_size}")
+        
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.time_offset = time_offset
+        self.shuffle = shuffle
+        self.generator = torch.Generator()
+        self.generator.manual_seed(seed)
+        
+        # 构建episode索引映射
+        self._build_episode_mapping()
+        
+    def _build_episode_mapping(self):
+        """构建episode到样本索引的映射，并找出可以作为起始点的有效样本。"""
+        # LeRobotDataset的episode_data_index是一个DataFrame，包含'from'和'to'列
+        episode_data_index = self.dataset.episode_data_index
+        
+        # 为每个样本建立快速查找：样本索引 -> (episode_idx, 在episode中的位置)
+        self.sample_to_episode = {}
+        self.episode_ranges = []  # [(from_idx, to_idx), ...]
+        
+        for episode_idx in range(len(episode_data_index)):
+            from_idx = episode_data_index["from"].iloc[episode_idx]
+            to_idx = episode_data_index["to"].iloc[episode_idx]
+            self.episode_ranges.append((from_idx, to_idx))
+            
+            # 记录每个样本所属的episode和位置
+            for pos, sample_idx in enumerate(range(from_idx, to_idx)):
+                self.sample_to_episode[sample_idx] = (episode_idx, pos)
+        
+        # 找出所有可以作为起始点的有效样本（后面还有time_offset个样本）
+        self.valid_start_indices = []
+        for sample_idx in range(len(self.dataset)):
+            if sample_idx in self.sample_to_episode:
+                episode_idx, pos = self.sample_to_episode[sample_idx]
+                from_idx, to_idx = self.episode_ranges[episode_idx]
+                # 检查是否有足够的空间容纳offset
+                if sample_idx + self.time_offset < to_idx:
+                    self.valid_start_indices.append(sample_idx)
+        
+        logging.info(f"找到 {len(self.valid_start_indices)} 个有效的起始样本 "
+                    f"(可以配对 {len(self.valid_start_indices)} 对, 时间偏移={self.time_offset})")
+        logging.info(f"数据利用率: {len(self.valid_start_indices)}/{len(self.dataset)} "
+                    f"= {100.0 * len(self.valid_start_indices) / len(self.dataset):.1f}%")
+        
+    def __iter__(self):
+        """生成batch中的索引。"""
+        # 可用的起始样本
+        available_indices = self.valid_start_indices.copy()
+        
+        if self.shuffle:
+            # 打乱起始样本的顺序
+            perm = torch.randperm(len(available_indices), generator=self.generator).tolist()
+            available_indices = [available_indices[i] for i in perm]
+        
+        # 每次采样 batch_size/2 个起始样本
+        samples_per_batch = self.batch_size // 2
+        
+        for batch_start in range(0, len(available_indices), samples_per_batch):
+            batch_start_indices = available_indices[batch_start:batch_start + samples_per_batch]
+            
+            # 如果最后一个batch不完整，跳过
+            if len(batch_start_indices) < samples_per_batch:
+                continue
+            
+            # 对于每个起始样本，找到它的配对样本（偏移time_offset）
+            batch_indices = []
+            for start_idx in batch_start_indices:
+                pair_idx = start_idx + self.time_offset
+                # 交错排列：[t1, t1+offset, t2, t2+offset, ...]
+                batch_indices.extend([start_idx, pair_idx])
+            
+            yield from batch_indices
+    
+    def __len__(self):
+        """返回总样本数（不是batch数）。"""
+        samples_per_batch = self.batch_size // 2
+        num_complete_batches = len(self.valid_start_indices) // samples_per_batch
+        return num_complete_batches * self.batch_size
+
+
 class Dataset(Protocol[T_co]):
     """Interface for a dataset with random access."""
 
@@ -228,6 +334,8 @@ def create_data_loader(
     num_batches: int | None = None,
     skip_norm_stats: bool = False,
     framework: Literal["jax", "pytorch"] = "jax",
+    use_temporal_pairs: bool = False,
+    temporal_pair_offset: int = 5,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training.
 
@@ -238,11 +346,15 @@ def create_data_loader(
         num_batches: Determines the number of batches to return.
         skip_norm_stats: Whether to skip data normalization.
         framework: The framework to use ("jax" or "pytorch").
+        use_temporal_pairs: 是否使用时间配对采样。
+        temporal_pair_offset: 时间配对的偏移量（时间步数）。
     """
     data_config = config.data.create(config.assets_dirs, config.model)
     logging.info(f"data_config: {data_config}")
 
     if data_config.rlds_data_dir is not None:
+        if use_temporal_pairs:
+            logging.warning("RLDS数据加载器暂不支持时间配对采样，将使用标准采样。")
         return create_rlds_data_loader(
             data_config,
             action_horizon=config.model.action_horizon,
@@ -265,6 +377,8 @@ def create_data_loader(
         seed=config.seed,
         skip_norm_stats=skip_norm_stats,
         framework=framework,
+        use_temporal_pairs=use_temporal_pairs,
+        temporal_pair_offset=temporal_pair_offset,
     )
 
 
@@ -281,6 +395,8 @@ def create_torch_data_loader(
     num_workers: int = 0,
     seed: int = 0,
     framework: str = "jax",
+    use_temporal_pairs: bool = False,
+    temporal_pair_offset: int = 5,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training.
 
@@ -298,6 +414,9 @@ def create_torch_data_loader(
         num_workers: The number of worker processes to use. If zero, the data loader will
             execute in the main process.
         seed: The seed to use for shuffling the data.
+        use_temporal_pairs: 是否使用时间配对采样。如果为True，batch中的样本将成对出现，
+            每对来自同一轨迹且相差temporal_pair_offset个时间步。
+        temporal_pair_offset: 时间配对的偏移量（时间步数），默认为5。
     """
     dataset = create_torch_dataset(data_config, action_horizon, model_config)
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
@@ -320,6 +439,19 @@ def create_torch_data_loader(
             local_batch_size = batch_size
     else:
         local_batch_size = batch_size // jax.process_count()
+
+    # 如果使用时间配对采样，创建TemporalPairSampler
+    if use_temporal_pairs:
+        if sampler is not None:
+            raise ValueError("使用时间配对采样时不支持分布式训练（DistributedSampler）")
+        logging.info(f"使用时间配对采样，偏移量={temporal_pair_offset}")
+        sampler = TemporalPairSampler(
+            dataset,
+            batch_size=local_batch_size,
+            time_offset=temporal_pair_offset,
+            shuffle=shuffle,
+            seed=seed,
+        )
 
     logging.info(f"local_batch_size: {local_batch_size}")
     data_loader = TorchDataLoader(

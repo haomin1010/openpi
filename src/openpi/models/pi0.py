@@ -182,7 +182,7 @@ class Pi0(_model.BaseModel):
         tokens.append(action_expert_tokens)
         input_mask.append(jnp.ones(action_expert_tokens.shape[:2], dtype=jnp.bool_))
         # image/language/state inputs do not attend to action tokens
-        ar_mask += [True] + ([False] * (self.action_horizon + 1))
+        ar_mask += [True] + ([False] * (self.action_horizon - 1)) + [True, True]
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
@@ -201,8 +201,8 @@ class Pi0(_model.BaseModel):
         noise = jax.random.normal(noise_rng, noise_shape)
         time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
         time_expanded = time[..., None, None]
-        x_t = time_expanded * noise + (1 - time_expanded) * actions
-        u_t = noise - actions
+        x_t = time_expanded * noise[:, :-2, :] + (1 - time_expanded) * actions
+        u_t = noise[:, :-2, :] - actions
 
         # one big forward pass of prefix + suffix at once
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
@@ -214,9 +214,12 @@ class Pi0(_model.BaseModel):
         (prefix_out, suffix_out), _ = self.PaliGemma.llm(
             [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
         )
-        v_t = self.action_out_proj(suffix_out[:, -self.action_horizon - 2:-2])
+        v_t = self.action_out_proj(suffix_out[:, -self.action_horizon - 2:])
 
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        even_vectors = v_t[::2, -1, :]
+        odd_vectors = v_t[1::2, -1, :]
+
+        return jnp.mean(jnp.square(v_t[:, :-2, :] - u_t), axis=-1) - jnp.mean(jnp.dot(even_vectors, odd_vectors), axis=-1)
 
     @override
     def sample_actions(

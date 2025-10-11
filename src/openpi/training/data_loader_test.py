@@ -82,3 +82,32 @@ def test_with_real_dataset():
 
     for _, actions in batches:
         assert actions.shape == (config.batch_size, config.model.action_horizon, config.model.action_dim)
+
+
+def test_temporal_pair_sampling():
+    """测试时间配对采样功能"""
+    config = _config.get_config("debug")
+    # 确保batch_size是偶数
+    config = dataclasses.replace(
+        config,
+        batch_size=4,
+        use_temporal_pairs=True,
+        temporal_pair_offset=5,
+    )
+
+    loader = _data_loader.create_data_loader(
+        config,
+        skip_norm_stats=True,
+        num_batches=2,
+        use_temporal_pairs=True,
+        temporal_pair_offset=5,
+    )
+    batches = list(loader)
+
+    assert len(batches) == 2
+
+    for _, actions in batches:
+        # 验证batch size正确
+        assert actions.shape[0] == config.batch_size
+        # 验证batch size是偶数
+        assert config.batch_size % 2 == 0

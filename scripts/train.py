@@ -221,6 +221,9 @@ def main(config: _config.TrainConfig):
         config,
         sharding=data_sharding,
         shuffle=True,
+        use_temporal_pairs=config.use_temporal_pairs,
+        temporal_pair_offset=config.temporal_pair_offset,
+        skip_norm_stats=True,
     )
     data_iter = iter(data_loader)
     batch = next(data_iter)
