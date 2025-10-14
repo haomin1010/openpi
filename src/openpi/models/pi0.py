@@ -12,8 +12,21 @@ from openpi.models import pi0_config
 import openpi.models.gemma as _gemma
 import openpi.models.siglip as _siglip
 from openpi.shared import array_typing as at
+from jax import lax
 
 logger = logging.getLogger("openpi")
+
+
+class MLP(nnx.Module):
+    def __init__(self, in_dim, hidden_dim, out_dim, *, rngs):
+        self.fc1 = nnx.Linear(in_dim, hidden_dim, rngs=rngs)
+        self.fc2 = nnx.Linear(hidden_dim, out_dim, rngs=rngs)
+        self.activation = jax.nn.relu
+
+    def __call__(self, x):
+        x = self.activation(self.fc1(x))
+        x = self.fc2(x)
+        return x
 
 
 def make_attn_mask(input_mask, mask_ar):
@@ -40,13 +53,18 @@ def make_attn_mask(input_mask, mask_ar):
     mask_ar = jnp.broadcast_to(mask_ar, input_mask.shape)
     cumsum = jnp.cumsum(mask_ar, axis=1)
     attn_mask = cumsum[:, None, :] <= cumsum[:, :, None]
+
+    attn_mask  = attn_mask.at[:,-2:, :].set(True)
+    attn_mask  = attn_mask.at[:,-1,-5:].set(False)
+    attn_mask  = attn_mask.at[:,-2,-10:-5].set(False)
     valid_mask = input_mask[:, None, :] * input_mask[:, :, None]
+
     return jnp.logical_and(attn_mask, valid_mask)
 
 
 @at.typecheck
 def posemb_sincos(
-    pos: at.Real[at.Array, " b"], embedding_dim: int, min_period: float, max_period: float
+        pos: at.Real[at.Array, " b"], embedding_dim: int, min_period: float, max_period: float
 ) -> at.Float[at.Array, "b {embedding_dim}"]:
     """Computes sine-cosine positional embedding vectors for scalar positions."""
     if embedding_dim % 2 != 0:
@@ -99,12 +117,21 @@ class Pi0(_model.BaseModel):
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
 
+        self.obs_cls_proj = MLP(paligemma_config.width, paligemma_config.width, action_expert_config.width, rngs=rngs)
+        self.act_cls_proj = MLP(action_expert_config.width, paligemma_config.width, action_expert_config.width, rngs=rngs)
+
+        self.param_init = nnx.initializers.normal()
+
+        # 添加两个可学习的参数
+        self.pre_cls_param = nnx.Param(self.param_init(rngs(), (1, 2, paligemma_config.width)))
+        self.suf_cls_param = nnx.Param(self.param_init(rngs(), (1, 2, action_expert_config.width)))
+
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
 
     @at.typecheck
     def embed_prefix(
-        self, obs: _model.Observation
+            self, obs: _model.Observation
     ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"]]:
         input_mask = []
         ar_mask = []
@@ -132,13 +159,19 @@ class Pi0(_model.BaseModel):
             # full attention between image and language inputs
             ar_mask += [False] * tokenized_inputs.shape[1]
         tokens = jnp.concatenate(tokens, axis=1)
+
+        tokens = jnp.concatenate([jnp.repeat(self.pre_cls_param.value, repeats=tokens.shape[0], axis=0), tokens], axis=-2)
+        ar_mask += [False] * 2
+        input_mask.append(jnp.ones((tokens.shape[0], 2), dtype=jnp.bool_))
+
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
+
         return tokens, input_mask, ar_mask
 
     @at.typecheck
     def embed_suffix(
-        self, obs: _model.Observation, noisy_actions: _model.Actions, timestep: at.Float[at.Array, " b"]
+            self, obs: _model.Observation, noisy_actions: _model.Actions, timestep: at.Float[at.Array, " b"]
     ) -> tuple[
         at.Float[at.Array, "b s emb"],
         at.Bool[at.Array, "b s"],
@@ -181,13 +214,19 @@ class Pi0(_model.BaseModel):
         # image/language/state inputs do not attend to action tokens
         ar_mask += [True] + ([False] * (self.action_horizon - 1))
         tokens = jnp.concatenate(tokens, axis=1)
+
+        tokens = jnp.concatenate([tokens, jnp.repeat(self.suf_cls_param.value, repeats=tokens.shape[0], axis=0)], axis=-2)
+        ar_mask += [True] * 2
+        input_mask.append(jnp.ones((tokens.shape[0], 2), dtype=jnp.bool_))
+
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
+
         return tokens, input_mask, ar_mask, adarms_cond
 
     @override
     def compute_loss(
-        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+            self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> at.Float[at.Array, "*b ah"]:
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
@@ -209,19 +248,23 @@ class Pi0(_model.BaseModel):
         (prefix_out, suffix_out), _ = self.PaliGemma.llm(
             [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
         )
-        v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+        v_t = self.action_out_proj(suffix_out[:, -self.action_horizon-2:-2])
 
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        obs_cls_out = self.obs_cls_proj(prefix_out[:,:2, :])
+        act_cls_out = self.act_cls_proj(suffix_out[:, -2:, :])
+        similarity = jnp.einsum('bih,bih->bi', obs_cls_out, act_cls_out)
+        return jnp.mean(jnp.square(v_t - u_t), axis=-1) - 0.1 * (1-time) * similarity
 
     @override
     def sample_actions(
-        self,
-        rng: at.KeyArrayLike,
-        observation: _model.Observation,
-        *,
-        num_steps: int | at.Int[at.Array, ""] = 10,
-        noise: at.Float[at.Array, "b ah ad"] | None = None,
-    ) -> _model.Actions:
+            self,
+            rng: at.KeyArrayLike,
+            observation: _model.Observation,
+            *,
+            num_steps: int | at.Int[at.Array, ""] = 10,
+            noise: at.Float[at.Array, "b ah ad"] | None = None,
+            old_obs_cls_head: at.Float[at.Array, "b hd"] = None,
+    ) -> (_model.Actions, at.Float[at.Array, "b hd"]):
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
@@ -234,7 +277,10 @@ class Pi0(_model.BaseModel):
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
-        _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+
+        (prefix_out, _), kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+
+        obs_cls_heads = self.obs_cls_proj(prefix_out[:,:2, :])
 
         def step(carry):
             x_t, time = carry
@@ -266,7 +312,7 @@ class Pi0(_model.BaseModel):
                 adarms_cond=[None, adarms_cond],
             )
             assert prefix_out is None
-            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon-2:-2])
 
             return x_t + dt * v_t, time + dt
 
@@ -275,5 +321,16 @@ class Pi0(_model.BaseModel):
             # robust to floating-point error
             return time >= -dt / 2
 
-        x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
-        return x_0
+        def skip(carry):
+            x_t, time = carry
+            return x_t, time
+
+        should_sample = jnp.mean(jnp.sum(obs_cls_heads[:, 1, :] * old_obs_cls_head, axis=-1)) < 0.5
+        
+        x_0, _ = lax.cond(
+            should_sample,
+            lambda operand: jax.lax.while_loop(cond, step, operand),
+            lambda operand: skip(operand),
+            (noise, 1.0)
+        )
+        return x_0, obs_cls_heads[:, 1, :]

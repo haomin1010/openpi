@@ -54,6 +54,7 @@ class Policy(BasePolicy):
         self._metadata = metadata or {}
         self._is_pytorch_model = is_pytorch
         self._pytorch_device = pytorch_device
+        self.old_cls_head = None
 
         if self._is_pytorch_model:
             self._model = self._model.to(pytorch_device)
@@ -88,10 +89,17 @@ class Policy(BasePolicy):
             sample_kwargs["noise"] = noise
 
         observation = _model.Observation.from_dict(inputs)
+        if self.old_cls_head is None and not self._is_pytorch_model:
+            self.old_cls_head = jnp.zeros((observation.state.shape[0], self._model.suf_cls_param.value.shape[2]), dtype=self._model.suf_cls_param.value.dtype)
+
+        sample_kwargs["old_obs_cls_head"] = self.old_cls_head
+
         start_time = time.monotonic()
+        actions, cls_head =  self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs)
+        self.old_cls_head = cls_head
         outputs = {
             "state": inputs["state"],
-            "actions": self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs),
+            "actions": actions,
         }
         model_time = time.monotonic() - start_time
         if self._is_pytorch_model:
