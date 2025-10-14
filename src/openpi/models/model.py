@@ -234,10 +234,25 @@ class BaseModelConfig(abc.ABC):
         """Create a model with the given parameters."""
         model = nnx.eval_shape(self.create, jax.random.key(0))
         graphdef, state = nnx.split(model)
+        
+        # 获取当前模型的参数字典
+        state_dict = state.to_pure_dict()
+        
         if remove_extra_params:
-            params = ocp.transform_utils.intersect_trees(state.to_pure_dict(), params)
-        at.check_pytree_equality(expected=state.to_pure_dict(), got=params, check_shapes=True, check_dtypes=False)
-        state.replace_by_pure_dict(params)
+            params = ocp.transform_utils.intersect_trees(state_dict, params)
+        
+        # 只检查和替换checkpoint中存在的参数，新参数保持初始化值
+        intersection_params = ocp.transform_utils.intersect_trees(params, state_dict)
+        at.check_pytree_equality(expected=intersection_params, got=params, check_shapes=True, check_dtypes=False)
+        
+        # 将checkpoint参数与初始化参数合并
+        merged_params = jax.tree_util.tree_map(lambda x: x, state_dict)  # 复制state_dict
+        flat_merged = traverse_util.flatten_dict(merged_params)
+        flat_params = traverse_util.flatten_dict(params)
+        flat_merged.update(flat_params)  # 用checkpoint参数更新
+        merged_params = traverse_util.unflatten_dict(flat_merged)
+        
+        state.replace_by_pure_dict(merged_params)
         return nnx.merge(graphdef, state)
 
     def load_pytorch(self, train_config, weight_path: str):
