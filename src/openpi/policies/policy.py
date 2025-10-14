@@ -90,7 +90,11 @@ class Policy(BasePolicy):
 
         observation = _model.Observation.from_dict(inputs)
         if self.old_cls_head is None and not self._is_pytorch_model:
-            self.old_cls_head = jnp.zeros((observation.state.shape[0], self._model.suf_cls_param.value.shape[2]), dtype=self._model.suf_cls_param.value.dtype)
+            # 安全地获取维度，如果模型没有 suf_cls_param 则跳过初始化
+            if hasattr(self._model, 'suf_cls_param') and hasattr(self._model.suf_cls_param, 'value'):
+                cls_dim = self._model.suf_cls_param.value.shape[2]
+                cls_dtype = self._model.suf_cls_param.value.dtype
+                self.old_cls_head = jnp.zeros((observation.state.shape[0], cls_dim), dtype=cls_dtype)
 
         sample_kwargs["old_obs_cls_head"] = self.old_cls_head
 

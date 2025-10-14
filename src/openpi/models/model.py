@@ -232,10 +232,11 @@ class BaseModelConfig(abc.ABC):
 
     def load(self, params: at.Params, *, remove_extra_params: bool = True) -> "BaseModel":
         """Create a model with the given parameters."""
-        model = nnx.eval_shape(self.create, jax.random.key(0))
+        # 真正创建模型（而不是只获取形状），这样新参数会被正确初始化
+        model = self.create(jax.random.key(0))
         graphdef, state = nnx.split(model)
         
-        # 获取当前模型的参数字典
+        # 获取当前模型的参数字典（包含真实初始化的新参数）
         state_dict = state.to_pure_dict()
         
         if remove_extra_params:
@@ -246,10 +247,10 @@ class BaseModelConfig(abc.ABC):
         at.check_pytree_equality(expected=intersection_params, got=params, check_shapes=True, check_dtypes=False)
         
         # 将checkpoint参数与初始化参数合并
-        merged_params = jax.tree_util.tree_map(lambda x: x, state_dict)  # 复制state_dict
+        merged_params = jax.tree_util.tree_map(lambda x: x, state_dict)  # 复制state_dict（保留新参数的真实初始值）
         flat_merged = traverse_util.flatten_dict(merged_params)
         flat_params = traverse_util.flatten_dict(params)
-        flat_merged.update(flat_params)  # 用checkpoint参数更新
+        flat_merged.update(flat_params)  # 用checkpoint参数更新已有参数
         merged_params = traverse_util.unflatten_dict(flat_merged)
         
         state.replace_by_pure_dict(merged_params)
