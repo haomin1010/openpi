@@ -462,6 +462,7 @@ class TrainConfig:
     # Experiment name. Will be used to name the metadata and checkpoint directories.
     exp_name: str = tyro.MISSING
 
+    cls_train: bool = False
     # Defines the model config. Some attributes (action_dim, action_horizon, and max_token_len) are shared by all models
     # -- see BaseModelConfig. Specific model implementations (e.g., Pi0Config) inherit from BaseModelConfig and may
     # define additional attributes.
