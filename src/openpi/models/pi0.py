@@ -378,7 +378,7 @@ class Pi0(_model.BaseModel):
         prefix_out_frozen = jax.lax.stop_gradient(prefix_out[:, 2:, :])
         prefix_out = jnp.concatenate([prefix_out[:, :2, :], prefix_out_frozen], axis=1)
 
-        def step(carry):
+        def body(carry, _):
             x_t, time, _ = carry
             # embed_suffix but with freezing except for suf_cls_param
             suffix_input_mask = []
@@ -443,16 +443,18 @@ class Pi0(_model.BaseModel):
             v_t_raw = self.action_out_proj(suffix_out[:, -self.action_horizon - 2:-2])
             v_t = jax.lax.stop_gradient(v_t_raw)
 
-            return x_t + dt * v_t, time + dt, suffix_out
+            return (x_t + dt * v_t, time + dt, suffix_out), None
 
-        def cond(carry):
-            x_t, time, suffix_out = carry
-            return time >= -dt / 2
-
-        # Execute first step to get initial suffix_out shape and value
-        x_t_init, time_init, suffix_out_init = step((noise, 1.0, jnp.zeros((batch_size, self.action_horizon + (0 if self.pi05 else 1) + 2, self.action_in_proj.out_features))))
-        # Continue loop from the first step result
-        _, _, suffix_out = jax.lax.while_loop(cond, step, (x_t_init, time_init, suffix_out_init))
+        # Fixed-length unrolled loop via scan to enable reverse-mode autodiff
+        suffix_len = (0 if self.pi05 else 1) + self.action_horizon + 2
+        suffix_width = self.action_out_proj.in_features
+        init_suffix_out = jnp.zeros((batch_size, suffix_len, suffix_width), dtype=prefix_out.dtype)
+        (x_t_final, time_final, suffix_out), _ = jax.lax.scan(
+            body,
+            (noise, 1.0, init_suffix_out),
+            xs=None,
+            length=num_steps,
+        )
 
         obs_cls_out = self.obs_cls_proj(prefix_out[:, :2, :])
         act_cls_out = self.act_cls_proj(suffix_out[:, -2:, :])
