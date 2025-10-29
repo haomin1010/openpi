@@ -282,7 +282,19 @@ def main(config: _config.TrainConfig):
         if step % config.log_interval == 0:
             stacked_infos = common_utils.stack_forest(infos)
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
-            info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
+            def format_value(v):
+                """Format value for logging, handling JAX arrays and scalars."""
+                try:
+                    # Try to convert to float and format
+                    if hasattr(v, 'item'):  # JAX array or numpy scalar
+                        return f"{float(v.item()):.4f}"
+                    else:
+                        return f"{float(v):.4f}"
+                except (ValueError, TypeError):
+                    # If conversion fails, return as string
+                    return str(v)
+            
+            info_str = ", ".join(f"{k}={format_value(v)}" for k, v in reduced_info.items())
             pbar.write(f"Step {step}: {info_str}")
             wandb.log(reduced_info, step=step)
             infos = []
