@@ -321,9 +321,8 @@ class Pi0(_model.BaseModel):
     ) -> at.Float[at.Array, "*b"]:
         """Compute cls loss with all parameters frozen except pre_cls_param and suf_cls_param.
 
-        This function freezes all modules and their outputs using stop_gradient,
-        but preserves gradients for pre_cls_param and suf_cls_param by using
-        their values directly without stop_gradient.
+        Parameter freezing is handled at the optimizer level via freeze_filter,
+        so stop_gradient is not needed here.
         """
         num_steps = 10
         observation = _model.preprocess_observation(None, observation, train=False)
@@ -332,15 +331,13 @@ class Pi0(_model.BaseModel):
 
         noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
 
-        # Freeze embed_prefix except for pre_cls_param
-        # We manually reconstruct embed_prefix but freeze all intermediate outputs
+        # Embed prefix (parameters are frozen via optimizer filter)
         input_mask = []
         ar_mask = []
         tokens = []
-        # embed images - frozen
+        # embed images
         for name in observation.images:
             image_tokens, _ = self.PaliGemma.img(observation.images[name], train=False)
-            image_tokens = jax.lax.stop_gradient(image_tokens)
             tokens.append(image_tokens)
             input_mask.append(
                 einops.repeat(
@@ -351,16 +348,15 @@ class Pi0(_model.BaseModel):
             )
             ar_mask += [False] * image_tokens.shape[1]
 
-        # add language - frozen
+        # add language
         if observation.tokenized_prompt is not None:
             tokenized_inputs = self.PaliGemma.llm(observation.tokenized_prompt, method="embed")
-            tokenized_inputs = jax.lax.stop_gradient(tokenized_inputs)
             tokens.append(tokenized_inputs)
             input_mask.append(observation.tokenized_prompt_mask)
             ar_mask += [False] * tokenized_inputs.shape[1]
         tokens = jnp.concatenate(tokens, axis=1)
 
-        # pre_cls_param is NOT frozen - keep it trainable
+        # pre_cls_param is trainable (not frozen by optimizer filter)
         pre_cls_tokens = jnp.repeat(self.pre_cls_param.value, repeats=tokens.shape[0], axis=0)
         prefix_tokens = jnp.concatenate([pre_cls_tokens, tokens], axis=-2)
         ar_mask = [False] * 2 + ar_mask
@@ -371,28 +367,23 @@ class Pi0(_model.BaseModel):
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
 
-        # PaliGemma output - freeze all except first 2 tokens (pre_cls_param)
+        # PaliGemma output
         (prefix_out, _), kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask,
                                                        positions=positions)
-        # Freeze everything except the first 2 tokens (from pre_cls_param)
-        prefix_out_frozen = jax.lax.stop_gradient(prefix_out[:, 2:, :])
-        prefix_out = jnp.concatenate([prefix_out[:, :2, :], prefix_out_frozen], axis=1)
 
         def body(carry, _):
             x_t, time, _ = carry
-            # embed_suffix but with freezing except for suf_cls_param
+            # embed_suffix (parameters are frozen via optimizer filter)
             suffix_input_mask = []
             suffix_ar_mask = []
             suffix_tokens = []
             if not self.pi05:
                 state_token = self.state_proj(observation.state)[:, None, :]
-                state_token = jax.lax.stop_gradient(state_token)
                 suffix_tokens.append(state_token)
                 suffix_input_mask.append(jnp.ones((observation.state.shape[0], 1), dtype=jnp.bool_))
                 suffix_ar_mask += [True]
 
             action_tokens = self.action_in_proj(x_t)
-            action_tokens = jax.lax.stop_gradient(action_tokens)
             time_emb = posemb_sincos(jnp.broadcast_to(time, batch_size), self.action_in_proj.out_features,
                                      min_period=4e-3, max_period=4.0)
             if self.pi05:
@@ -401,14 +392,13 @@ class Pi0(_model.BaseModel):
                 time_emb = self.time_mlp_out(time_emb)
                 time_emb = nnx.swish(time_emb)
                 action_expert_tokens = action_tokens
-                adarms_cond = jax.lax.stop_gradient(time_emb)
+                adarms_cond = time_emb
             else:
                 time_tokens = einops.repeat(time_emb, "b emb -> b s emb", s=self.action_horizon)
                 action_time_tokens = jnp.concatenate([action_tokens, time_tokens], axis=-1)
                 action_time_tokens = self.action_time_mlp_in(action_time_tokens)
                 action_time_tokens = nnx.swish(action_time_tokens)
                 action_time_tokens = self.action_time_mlp_out(action_time_tokens)
-                action_time_tokens = jax.lax.stop_gradient(action_time_tokens)
                 action_expert_tokens = action_time_tokens
                 adarms_cond = None
             suffix_tokens.append(action_expert_tokens)
@@ -416,7 +406,7 @@ class Pi0(_model.BaseModel):
             suffix_ar_mask += [True] + ([False] * (self.action_horizon - 1))
             suffix_tokens_concat = jnp.concatenate(suffix_tokens, axis=1)
 
-            # suf_cls_param is NOT frozen - keep it trainable
+            # suf_cls_param is trainable (not frozen by optimizer filter)
             suf_cls_tokens = jnp.repeat(self.suf_cls_param.value, repeats=suffix_tokens_concat.shape[0], axis=0)
             suffix_tokens = jnp.concatenate([suffix_tokens_concat, suf_cls_tokens], axis=-2)
             suffix_ar_mask += [True] * 2
@@ -437,11 +427,7 @@ class Pi0(_model.BaseModel):
                 kv_cache=kv_cache,
                 adarms_cond=[None, adarms_cond],
             )
-            # Freeze everything except the last 2 tokens (from suf_cls_param)
-            suffix_out_frozen = jax.lax.stop_gradient(suffix_out[:, :-2, :])
-            suffix_out = jnp.concatenate([suffix_out_frozen, suffix_out[:, -2:, :]], axis=1)
-            v_t_raw = self.action_out_proj(suffix_out[:, -self.action_horizon - 2:-2])
-            v_t = jax.lax.stop_gradient(v_t_raw)
+            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon - 2:-2])
 
             return (x_t + dt * v_t, time + dt, suffix_out), None
 
