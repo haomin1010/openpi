@@ -152,6 +152,16 @@ def train_step(
     model = nnx.merge(state.model_def, state.params)
     model.train()
 
+    # Ensure we use the same trainable filter as during optimizer init when cls_train is enabled.
+    if getattr(config, "cls_train", False):
+        cls_exclusive_freeze = nnx.All(
+            nnx.Param,
+            nnx.Not(nnx_utils.PathRegex(r".*/(pre_cls_param|suf_cls_param|act_cls_proj|obs_cls_proj)(/.*)?")),
+        )
+        effective_trainable_filter = nnx.All(nnx.Param, nnx.Not(cls_exclusive_freeze))
+    else:
+        effective_trainable_filter = config.trainable_filter
+
     @at.typecheck
     def loss_fn(
         model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
@@ -163,10 +173,10 @@ def train_step(
     observation, actions = batch
 
     # Filter out frozen params.
-    diff_state = nnx.DiffState(0, config.trainable_filter)
+    diff_state = nnx.DiffState(0, effective_trainable_filter)
     loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
 
-    params = state.params.filter(config.trainable_filter)
+    params = state.params.filter(effective_trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
     new_params = optax.apply_updates(params, updates)
 
