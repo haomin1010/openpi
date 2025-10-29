@@ -15,7 +15,7 @@ from openpi.shared import array_typing as at
 class TrainState:
     step: at.Int[at.ArrayLike, ""]
     params: nnx.State
-    model_def: nnx.GraphDef[_model.BaseModel]
+    model_def: nnx.GraphDef[_model.BaseModel] = struct.field(pytree_node=False)
     opt_state: optax.OptState
     tx: optax.GradientTransformation = struct.field(pytree_node=False)
 
