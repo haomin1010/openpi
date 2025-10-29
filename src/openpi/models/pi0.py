@@ -289,77 +289,8 @@ class Pi0(_model.BaseModel):
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
 
         if cls_train:
-            num_steps = 10
-            observation = _model.preprocess_observation(None, observation, train=False)
-            # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
-            # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
-            dt = -1.0 / num_steps
-            batch_size = observation.state.shape[0]
-
-            noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
-
-            # first fill KV cache with a forward pass of the prefix
-            prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
-            prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
-            positions = jnp.cumsum(prefix_mask, axis=1) - 1
-
-            (prefix_out, _), kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask,
-                                                           positions=positions)
-
-            obs_cls_heads = self.obs_cls_proj(prefix_out[:, :2, :])
-            def step(carry):
-                x_t, time = carry
-                suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
-                    observation, x_t, jnp.broadcast_to(time, batch_size)
-                )
-                # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to each
-                # other
-                suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
-                # `prefix_attn_mask` is shape (b, suffix_len, prefix_len) indicating how the suffix tokens can attend to the
-                # prefix tokens
-                prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
-                # `combined_mask` is shape (b, suffix_len, prefix_len + suffix_len) indicating how the suffix tokens (which
-                # generate the queries) can attend to the full prefix + suffix sequence (which generates the keys and values)
-                full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
-                assert full_attn_mask.shape == (
-                    batch_size,
-                    suffix_tokens.shape[1],
-                    prefix_tokens.shape[1] + suffix_tokens.shape[1],
-                )
-                # `positions` is shape (b, suffix_len) indicating the positions of the suffix tokens
-                positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
-
-                (prefix_out, suffix_out), _ = self.PaliGemma.llm(
-                    [None, suffix_tokens],
-                    mask=full_attn_mask,
-                    positions=positions,
-                    kv_cache=kv_cache,
-                    adarms_cond=[None, adarms_cond],
-                )
-                assert prefix_out is None
-                v_t = self.action_out_proj(suffix_out[:, -self.action_horizon - 2:-2])
-
-                return x_t + dt * v_t, time + dt, suffix_out
-
-            def cond(carry):
-                x_t, time, suffix_out = carry
-                # robust to floating-point error
-                return time >= -dt / 2
-
-            x_t, _,suffix_out  = jax.lax.while_loop(cond, step, (noise, 1.0))
-
-            obs_cls_out = self.obs_cls_proj(prefix_out[:, :2, :])  # [batch, 2, hidden_dim]
-            act_cls_out = self.act_cls_proj(suffix_out[:, -2:, :])  # [batch, 2, hidden_dim]
-
-            vicreg = vicreg_loss(
-                obs_cls_out,
-                act_cls_out,
-                lambda_param=25.0,
-                mu_param=25.0,
-                nu_param=1.0,
-            )
-
-            return jnp.mean(vicreg, axis=-1)
+            # Use dedicated function that freezes all params except pre_cls_param and suf_cls_param
+            return self._compute_cls_loss_with_frozen_params(rng, observation)
 
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
 
@@ -384,6 +315,157 @@ class Pi0(_model.BaseModel):
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon - 2:-2])
 
         return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+
+    def _compute_cls_loss_with_frozen_params(
+            self, rng: at.KeyArrayLike, observation: _model.Observation
+    ) -> at.Float[at.Array, "*b"]:
+        """Compute cls loss with all parameters frozen except pre_cls_param and suf_cls_param.
+
+        This function freezes all modules and their outputs using stop_gradient,
+        but preserves gradients for pre_cls_param and suf_cls_param by using
+        their values directly without stop_gradient.
+        """
+        num_steps = 10
+        observation = _model.preprocess_observation(None, observation, train=False)
+        dt = -1.0 / num_steps
+        batch_size = observation.state.shape[0]
+
+        noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
+
+        # Freeze embed_prefix except for pre_cls_param
+        # We manually reconstruct embed_prefix but freeze all intermediate outputs
+        input_mask = []
+        ar_mask = []
+        tokens = []
+        # embed images - frozen
+        for name in observation.images:
+            image_tokens, _ = self.PaliGemma.img(observation.images[name], train=False)
+            image_tokens = jax.lax.stop_gradient(image_tokens)
+            tokens.append(image_tokens)
+            input_mask.append(
+                einops.repeat(
+                    observation.image_masks[name],
+                    "b -> b s",
+                    s=image_tokens.shape[1],
+                )
+            )
+            ar_mask += [False] * image_tokens.shape[1]
+
+        # add language - frozen
+        if observation.tokenized_prompt is not None:
+            tokenized_inputs = self.PaliGemma.llm(observation.tokenized_prompt, method="embed")
+            tokenized_inputs = jax.lax.stop_gradient(tokenized_inputs)
+            tokens.append(tokenized_inputs)
+            input_mask.append(observation.tokenized_prompt_mask)
+            ar_mask += [False] * tokenized_inputs.shape[1]
+        tokens = jnp.concatenate(tokens, axis=1)
+
+        # pre_cls_param is NOT frozen - keep it trainable
+        pre_cls_tokens = jnp.repeat(self.pre_cls_param.value, repeats=tokens.shape[0], axis=0)
+        prefix_tokens = jnp.concatenate([pre_cls_tokens, tokens], axis=-2)
+        ar_mask = [False] * 2 + ar_mask
+        input_mask.append(jnp.ones((tokens.shape[0], 2), dtype=jnp.bool_))
+        prefix_mask = jnp.concatenate(input_mask, axis=1)
+        prefix_ar_mask = jnp.array(ar_mask)
+
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+
+        # PaliGemma output - freeze all except first 2 tokens (pre_cls_param)
+        (prefix_out, _), kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask,
+                                                       positions=positions)
+        # Freeze everything except the first 2 tokens (from pre_cls_param)
+        prefix_out_frozen = jax.lax.stop_gradient(prefix_out[:, 2:, :])
+        prefix_out = jnp.concatenate([prefix_out[:, :2, :], prefix_out_frozen], axis=1)
+
+        def step(carry):
+            x_t, time, _ = carry
+            # embed_suffix but with freezing except for suf_cls_param
+            suffix_input_mask = []
+            suffix_ar_mask = []
+            suffix_tokens = []
+            if not self.pi05:
+                state_token = self.state_proj(observation.state)[:, None, :]
+                state_token = jax.lax.stop_gradient(state_token)
+                suffix_tokens.append(state_token)
+                suffix_input_mask.append(jnp.ones((observation.state.shape[0], 1), dtype=jnp.bool_))
+                suffix_ar_mask += [True]
+
+            action_tokens = self.action_in_proj(x_t)
+            action_tokens = jax.lax.stop_gradient(action_tokens)
+            time_emb = posemb_sincos(jnp.broadcast_to(time, batch_size), self.action_in_proj.out_features,
+                                     min_period=4e-3, max_period=4.0)
+            if self.pi05:
+                time_emb = self.time_mlp_in(time_emb)
+                time_emb = nnx.swish(time_emb)
+                time_emb = self.time_mlp_out(time_emb)
+                time_emb = nnx.swish(time_emb)
+                action_expert_tokens = action_tokens
+                adarms_cond = jax.lax.stop_gradient(time_emb)
+            else:
+                time_tokens = einops.repeat(time_emb, "b emb -> b s emb", s=self.action_horizon)
+                action_time_tokens = jnp.concatenate([action_tokens, time_tokens], axis=-1)
+                action_time_tokens = self.action_time_mlp_in(action_time_tokens)
+                action_time_tokens = nnx.swish(action_time_tokens)
+                action_time_tokens = self.action_time_mlp_out(action_time_tokens)
+                action_time_tokens = jax.lax.stop_gradient(action_time_tokens)
+                action_expert_tokens = action_time_tokens
+                adarms_cond = None
+            suffix_tokens.append(action_expert_tokens)
+            suffix_input_mask.append(jnp.ones(action_expert_tokens.shape[:2], dtype=jnp.bool_))
+            suffix_ar_mask += [True] + ([False] * (self.action_horizon - 1))
+            suffix_tokens_concat = jnp.concatenate(suffix_tokens, axis=1)
+
+            # suf_cls_param is NOT frozen - keep it trainable
+            suf_cls_tokens = jnp.repeat(self.suf_cls_param.value, repeats=suffix_tokens_concat.shape[0], axis=0)
+            suffix_tokens = jnp.concatenate([suffix_tokens_concat, suf_cls_tokens], axis=-2)
+            suffix_ar_mask += [True] * 2
+            suffix_input_mask.append(jnp.ones((suffix_tokens_concat.shape[0], 2), dtype=jnp.bool_))
+
+            suffix_mask = jnp.concatenate(suffix_input_mask, axis=1)
+            suffix_ar_mask = jnp.array(suffix_ar_mask)
+
+            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+            prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
+            full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
+            positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+
+            (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+                [None, suffix_tokens],
+                mask=full_attn_mask,
+                positions=positions,
+                kv_cache=kv_cache,
+                adarms_cond=[None, adarms_cond],
+            )
+            # Freeze everything except the last 2 tokens (from suf_cls_param)
+            suffix_out_frozen = jax.lax.stop_gradient(suffix_out[:, :-2, :])
+            suffix_out = jnp.concatenate([suffix_out_frozen, suffix_out[:, -2:, :]], axis=1)
+            v_t_raw = self.action_out_proj(suffix_out[:, -self.action_horizon - 2:-2])
+            v_t = jax.lax.stop_gradient(v_t_raw)
+
+            return x_t + dt * v_t, time + dt, suffix_out
+
+        def cond(carry):
+            x_t, time, _ = carry
+            return time >= -dt / 2
+
+        # Execute first step to get initial suffix_out shape and value
+        x_t_init, time_init, suffix_out_init = step((noise, 1.0, jnp.zeros((batch_size, self.action_horizon + (0 if self.pi05 else 1) + 2, self.action_in_proj.out_features))))
+        # Continue loop from the first step result
+        _, _, suffix_out = jax.lax.while_loop(cond, step, (x_t_init, time_init, suffix_out_init))
+
+        obs_cls_out = self.obs_cls_proj(prefix_out[:, :2, :])
+        act_cls_out = self.act_cls_proj(suffix_out[:, -2:, :])
+
+        vicreg = vicreg_loss(
+            obs_cls_out,
+            act_cls_out,
+            lambda_param=25.0,
+            mu_param=25.0,
+            nu_param=1.0,
+        )
+
+        return jnp.mean(vicreg, axis=-1)
 
     @override
     def sample_actions(
@@ -456,7 +538,11 @@ class Pi0(_model.BaseModel):
             x_t, time = carry
             return x_t, time
 
-        should_sample = jnp.mean(jnp.sum(obs_cls_heads[:, 1, :] * old_obs_cls_head, axis=-1)) < 0.5
+        if old_obs_cls_head is not None:
+            should_sample = jnp.mean(jnp.sum(obs_cls_heads[:, 1, :] * old_obs_cls_head, axis=-1)) < 0.5
+        else:
+            # If old_obs_cls_head is None, always sample
+            should_sample = jnp.array(True)
 
         x_0, _ = lax.cond(
             should_sample,
