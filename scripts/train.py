@@ -85,6 +85,15 @@ def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shap
 def init_train_state(
     config: _config.TrainConfig, init_rng: at.KeyArrayLike, mesh: jax.sharding.Mesh, *, resume: bool
 ) -> tuple[training_utils.TrainState, Any]:
+    # If cls_train is enabled, freeze everything except pre_cls_param and suf_cls_param.
+    # This ensures LLM/vision backbones and projection heads are excluded from optimization.
+    if getattr(config, "cls_train", False):
+        cls_exclusive_freeze = nnx.All(
+            nnx.Param,
+            nnx.Not(nnx_utils.PathRegex(r".*/(pre_cls_param|suf_cls_param)(/.*)?")),
+        )
+        config = dataclasses.replace(config, freeze_filter=cls_exclusive_freeze)
+
     tx = _optimizer.create_optimizer(config.optimizer, config.lr_schedule, weight_decay_mask=None)
 
     def init(rng: at.KeyArrayLike, partial_params: at.Params | None = None) -> training_utils.TrainState:
