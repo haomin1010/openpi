@@ -178,11 +178,9 @@ class Pi0(_model.BaseModel):
         self.act_cls_proj = MLP(action_expert_config.width, paligemma_config.width, action_expert_config.width,
                                 rngs=rngs)
 
-        self.param_init = nnx.initializers.normal()
-
-        # 添加两个可学习的参数
-        self.pre_cls_param = nnx.Param(self.param_init(rngs(), (1, 2, paligemma_config.width)))
-        self.suf_cls_param = nnx.Param(self.param_init(rngs(), (1, 2, action_expert_config.width)))
+        # 添加两个可学习的参数（避免把初始化函数作为模块静态字段）
+        self.pre_cls_param = nnx.Param(nnx.initializers.normal()(rngs(), (1, 2, paligemma_config.width)))
+        self.suf_cls_param = nnx.Param(nnx.initializers.normal()(rngs(), (1, 2, action_expert_config.width)))
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
