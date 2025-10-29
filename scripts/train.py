@@ -90,7 +90,7 @@ def init_train_state(
     if getattr(config, "cls_train", False):
         cls_exclusive_freeze = nnx.All(
             nnx.Param,
-            nnx.Not(nnx_utils.PathRegex(r".*/(pre_cls_param|suf_cls_param)(/.*)?")),
+            nnx.Not(nnx_utils.PathRegex(r".*/(pre_cls_param|suf_cls_param|act_cls_proj|obs_cls_proj)(/.*)?")),
         )
         config = dataclasses.replace(config, freeze_filter=cls_exclusive_freeze)
 
