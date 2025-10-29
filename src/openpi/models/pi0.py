@@ -339,14 +339,14 @@ class Pi0(_model.BaseModel):
                 assert prefix_out is None
                 v_t = self.action_out_proj(suffix_out[:, -self.action_horizon - 2:-2])
 
-                return x_t + dt * v_t, time + dt
+                return x_t + dt * v_t, time + dt, suffix_out
 
             def cond(carry):
-                x_t, time = carry
+                x_t, time, suffix_out = carry
                 # robust to floating-point error
                 return time >= -dt / 2
 
-            suffix_out, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
+            x_t, _,suffix_out  = jax.lax.while_loop(cond, step, (noise, 1.0))
 
             obs_cls_out = self.obs_cls_proj(prefix_out[:, :2, :])  # [batch, 2, hidden_dim]
             act_cls_out = self.act_cls_proj(suffix_out[:, -2:, :])  # [batch, 2, hidden_dim]
