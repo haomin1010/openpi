@@ -320,7 +320,9 @@ class Pi0(_model.BaseModel):
         )
         vicreg_mean = jnp.mean(vicreg, axis=-1)  # [batch]
 
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1) + 0.01 * (1 - time) * vicreg_mean
+        # Broadcast VICReg term across action horizon
+        vicreg_term = 0.01 * (1 - time)[..., None] * vicreg_mean[..., None]  # [batch, 1]
+        return jnp.mean(jnp.square(v_t - u_t), axis=-1) + vicreg_term
 
     @override
     def sample_actions(
