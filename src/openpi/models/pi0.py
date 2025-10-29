@@ -446,7 +446,7 @@ class Pi0(_model.BaseModel):
             return x_t + dt * v_t, time + dt, suffix_out
 
         def cond(carry):
-            x_t, time, _ = carry
+            x_t, time, suffix_out = carry
             return time >= -dt / 2
 
         # Execute first step to get initial suffix_out shape and value
