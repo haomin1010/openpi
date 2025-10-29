@@ -69,9 +69,10 @@ def fsdp_sharding(
 
     def _shard_arr(kp, array: jax.ShapeDtypeStruct):
         # if this leaf is not an array-like (e.g., GraphDef/NodeDef/opt state metadata),
-        # do not specify sharding; JAX expects `None` for non-array leaves in out_shardings
+        # preserve the original metadata object so pytree structure (including custom nodes)
+        # matches exactly between result and reference.
         if not hasattr(array, "shape"):
-            return None
+            return array
         # if fsdp is not actually going to be used, replicate everything to avoid extraneous logging
         if mesh.shape[FSDP_AXIS] == 1:
             return jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
