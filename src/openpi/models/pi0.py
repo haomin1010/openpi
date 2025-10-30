@@ -100,8 +100,8 @@ def vicreg_loss(z1, z2, lambda_param=25.0, mu_param=25.0, nu_param=1.0, gamma=1.
 
     variance_loss = jnp.stack(variance_losses)
     #jax.debug.print("variance_loss per-token mean={m}", m=jnp.mean(variance_loss))
-    #covariance_loss = jnp.stack(covariance_losses)
-    jax.debug.print("covariance_loss per-token mean={m}", m=jnp.mean(covariance_loss))
+    covariance_loss = jnp.stack(covariance_losses)
+    #jax.debug.print("covariance_loss per-token mean={m}", m=jnp.mean(covariance_loss))
 
     # Summarize diagnostics across tokens
     # jax.debug.print(
