@@ -48,6 +48,8 @@ def vicreg_loss(z1, z2, lambda_param=25.0, mu_param=25.0, nu_param=1.0, gamma=1.
 
     invariance_loss = jnp.mean(jnp.square(z1 - z2), axis=-1)  # [batch, num_tokens]
 
+    jax.debug.print("invariance_loss sample={x}", x=invariance_loss)
+
     variance_losses = []
     covariance_losses = []
 
@@ -75,8 +77,9 @@ def vicreg_loss(z1, z2, lambda_param=25.0, mu_param=25.0, nu_param=1.0, gamma=1.
         covariance_losses.append(cov_loss)
 
     variance_loss = jnp.stack(variance_losses)
+    jax.debug.print("variance_loss sample={x}", x=variance_loss)
     covariance_loss = jnp.stack(covariance_losses)
-
+    jax.debug.print("covariance_loss sample={x}", x=covariance_loss)
     total_loss = (
             lambda_param * invariance_loss +
             mu_param * variance_loss[None, :] +
@@ -290,7 +293,7 @@ class Pi0(_model.BaseModel):
 
         if cls_train:
             # Use dedicated function that freezes all params except pre_cls_param and suf_cls_param
-            return self._compute_cls_loss_with_frozen_params(rng, observation)
+            return self._compute_cls_loss_with_frozen_params(rng, observation, actions)
 
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
 
@@ -317,7 +320,7 @@ class Pi0(_model.BaseModel):
         return jnp.mean(jnp.square(v_t - u_t), axis=-1)
 
     def _compute_cls_loss_with_frozen_params(
-            self, rng: at.KeyArrayLike, observation: _model.Observation
+            self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions,
     ) -> at.Float[at.Array, "*b"]:
         """Compute cls loss with all parameters frozen except pre_cls_param and suf_cls_param.
 
@@ -452,6 +455,11 @@ class Pi0(_model.BaseModel):
             mu_param=25.0,
             nu_param=1.0,
         )
+
+        jax.debug.print("act_cls_heads sample={x}", x=act_cls_out[0, 0, :])
+        jax.debug.print("obs_cls_heads sample={x}", x=obs_cls_out[0, 0, :])
+        jax.debug.print("actions sample={x}", x=actions[0, 0, :])
+        jax.debug.print("shape={x}", x=act_cls_out.shape)
 
         return jnp.mean(vicreg, axis=-1)
 
