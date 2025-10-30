@@ -122,9 +122,9 @@ def vicreg_loss(z1, z2, lambda_param=25.0, mu_param=25.0, nu_param=1.0, gamma=1.
     )
 
     jax.debug.print(
-        "variance_loss={c}",
-        # a=jnp.mean(jnp.stack(std_means_z1)),
-        # b=jnp.mean(jnp.stack(std_means_z2)),
+        "std_mean z1={a}, z2={b}, variance_loss={c}",
+        a=jnp.mean(jnp.stack(std_means_z1)),
+        b=jnp.mean(jnp.stack(std_means_z2)),
         c=jnp.mean(mu_param * variance_loss)
     )
     # jax.debug.print(
@@ -134,9 +134,9 @@ def vicreg_loss(z1, z2, lambda_param=25.0, mu_param=25.0, nu_param=1.0, gamma=1.
     #     c=jnp.mean(mu_param * variance_loss)
     # )
     jax.debug.print(
-        "covariance_loss={c}",
-        # a=jnp.mean(jnp.stack(cov_loss_z1_list)),
-        # b=jnp.mean(jnp.stack(cov_loss_z2_list)),
+        "cov_loss split mean: z1={a}, z2={b}, covariance_loss={c}",
+        a=jnp.mean(jnp.stack(cov_loss_z1_list)),
+        b=jnp.mean(jnp.stack(cov_loss_z2_list)),
         c=jnp.mean(nu_param * covariance_loss)
     )
     total_loss = (
