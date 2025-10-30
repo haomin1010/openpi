@@ -21,14 +21,17 @@ class MLP(nnx.Module):
     def __init__(self, in_dim, hidden_dim, out_dim, *, rngs):
         self.fc1 = nnx.Linear(in_dim, hidden_dim, rngs=rngs)
         self.fc2 = nnx.Linear(hidden_dim, hidden_dim, rngs=rngs)
-        self.fc3 = nnx.Linear(hidden_dim, out_dim, rngs=rngs)
+        self.fc3 = nnx.Linear(hidden_dim, hidden_dim, rngs=rngs)
+        self.fc4 = nnx.Linear(hidden_dim, out_dim, rngs=rngs)
         self.activation_1 = nnx.swish
         self.activation_2 = nnx.swish
+        self.activation_3 = nnx.swish
 
     def __call__(self, x):
         x = self.activation_1(self.fc1(x))
         x = self.activation_2(self.fc2(x))
-        x = self.fc3(x)
+        x = self.activation_3(self.fc3(x))
+        x = self.fc4(x)
 
         return x
 
@@ -236,8 +239,8 @@ class Pi0(_model.BaseModel):
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
 
-        self.obs_cls_proj = MLP(paligemma_config.width, paligemma_config.width, 256, rngs=rngs)
-        self.act_cls_proj = MLP(action_expert_config.width, paligemma_config.width, 256,
+        self.obs_cls_proj = MLP(paligemma_config.width, 2*paligemma_config.width, 256, rngs=rngs)
+        self.act_cls_proj = MLP(action_expert_config.width, 2*paligemma_config.width, 256,
                                 rngs=rngs)
 
         # 添加两个可学习的参数（避免把初始化函数作为模块静态字段）
@@ -514,9 +517,9 @@ class Pi0(_model.BaseModel):
         vicreg = vicreg_loss(
             obs_cls_out,
             act_cls_out,
-            lambda_param=25.0,
-            mu_param=25.0,
-            nu_param=1.0,
+            lambda_param=0.0,
+            mu_param=40.0,
+            nu_param=10.0,
         )
 
         # jax.debug.print("act_cls_heads sample={x}", x=act_cls_out[0, 0, :])

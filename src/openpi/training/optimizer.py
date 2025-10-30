@@ -71,7 +71,7 @@ class AdamW(OptimizerConfig):
     eps: float = 1e-8
     # Changing this to 0 can cause out-of-memory errors for some reason, so we set it to a negligible value.
     weight_decay: float = 1e-10
-    clip_gradient_norm: float = 1.0
+    clip_gradient_norm: float = 5.0
 
     def create(
         self,
