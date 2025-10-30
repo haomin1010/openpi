@@ -48,10 +48,18 @@ def vicreg_loss(z1, z2, lambda_param=25.0, mu_param=25.0, nu_param=1.0, gamma=1.
 
     invariance_loss = jnp.mean(jnp.square(z1 - z2), axis=-1)  # [batch, num_tokens]
 
-    jax.debug.print("invariance_loss sample={x}", x=invariance_loss)
+    jax.debug.print("VICReg dims: B={b}, T={t}, D={d}", b=z1.shape[0], t=z1.shape[1], d=z1.shape[2])
+    jax.debug.print("invariance_loss mean={m:.4f}", m=jnp.mean(invariance_loss))
 
     variance_losses = []
     covariance_losses = []
+    # Diagnostics collections
+    std_means_z1 = []
+    std_means_z2 = []
+    cov_offdiag_ratio_z1 = []
+    cov_offdiag_ratio_z2 = []
+    cov_loss_z1_list = []
+    cov_loss_z2_list = []
 
     for i in range(num_tokens):
         z1_i = z1[:, i, :]
@@ -59,6 +67,8 @@ def vicreg_loss(z1, z2, lambda_param=25.0, mu_param=25.0, nu_param=1.0, gamma=1.
 
         std_z1 = jnp.sqrt(jnp.var(z1_i, axis=0) + eps)
         std_z2 = jnp.sqrt(jnp.var(z2_i, axis=0) + eps)
+        std_means_z1.append(jnp.mean(std_z1))
+        std_means_z2.append(jnp.mean(std_z2))
 
         var_loss = jnp.mean(jax.nn.relu(gamma - std_z1)) + jnp.mean(jax.nn.relu(gamma - std_z2))
         variance_losses.append(var_loss)
@@ -70,16 +80,45 @@ def vicreg_loss(z1, z2, lambda_param=25.0, mu_param=25.0, nu_param=1.0, gamma=1.
         cov_z2 = (z2_centered.T @ z2_centered) / (batch_size - 1)
 
         off_diagonal_mask = 1 - jnp.eye(dim)
-        cov_loss = (
-                           jnp.sum(jnp.square(cov_z1 * off_diagonal_mask)) +
-                           jnp.sum(jnp.square(cov_z2 * off_diagonal_mask))
-                   ) / dim
+        offdiag_z1 = cov_z1 * off_diagonal_mask
+        offdiag_z2 = cov_z2 * off_diagonal_mask
+        # Separate covariance contributions for diagnostics
+        cov_loss_z1 = jnp.sum(jnp.square(offdiag_z1)) / dim
+        cov_loss_z2 = jnp.sum(jnp.square(offdiag_z2)) / dim
+        cov_loss = cov_loss_z1 + cov_loss_z2
+        cov_loss_z1_list.append(cov_loss_z1)
+        cov_loss_z2_list.append(cov_loss_z2)
+
+        # Off-diagonal ratio diagnostics
+        fro_z1 = jnp.linalg.norm(cov_z1)
+        fro_z2 = jnp.linalg.norm(cov_z2)
+        ratio_z1 = jnp.linalg.norm(offdiag_z1) / (fro_z1 + eps)
+        ratio_z2 = jnp.linalg.norm(offdiag_z2) / (fro_z2 + eps)
+        cov_offdiag_ratio_z1.append(ratio_z1)
+        cov_offdiag_ratio_z2.append(ratio_z2)
         covariance_losses.append(cov_loss)
 
     variance_loss = jnp.stack(variance_losses)
-    jax.debug.print("variance_loss sample={x}", x=variance_loss)
+    jax.debug.print("variance_loss per-token mean={m:.4f}", m=jnp.mean(variance_loss))
     covariance_loss = jnp.stack(covariance_losses)
-    jax.debug.print("covariance_loss sample={x}", x=covariance_loss)
+    jax.debug.print("covariance_loss per-token mean={m:.4f}", m=jnp.mean(covariance_loss))
+
+    # Summarize diagnostics across tokens
+    jax.debug.print(
+        "std_mean z1={a:.3f}, z2={b:.3f}",
+        a=jnp.mean(jnp.stack(std_means_z1)),
+        b=jnp.mean(jnp.stack(std_means_z2)),
+    )
+    jax.debug.print(
+        "cov_offdiag_ratio z1={a:.3f}, z2={b:.3f}",
+        a=jnp.mean(jnp.stack(cov_offdiag_ratio_z1)),
+        b=jnp.mean(jnp.stack(cov_offdiag_ratio_z2)),
+    )
+    jax.debug.print(
+        "cov_loss split mean: z1={a:.4f}, z2={b:.4f}",
+        a=jnp.mean(jnp.stack(cov_loss_z1_list)),
+        b=jnp.mean(jnp.stack(cov_loss_z2_list)),
+    )
     total_loss = (
             lambda_param * invariance_loss +
             mu_param * variance_loss[None, :] +
