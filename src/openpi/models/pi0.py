@@ -52,7 +52,9 @@ def vicreg_loss(z1, z2, lambda_param=25.0, mu_param=25.0, nu_param=1.0, gamma=1.
     z2_l2 = jnp.linalg.norm(z2, axis=-1, keepdims=True)
     z1_normed = z1 / (z1_l2 + eps)
     z2_normed = z2 / (z2_l2 + eps)
-    invariance_loss = jnp.mean(jnp.square(z1_normed - z2_normed), axis=-1)  # [batch, num_tokens]
+    # Use cosine distance: 1 - cosine_similarity, stable across dimensionality.
+    cosine_sim = jnp.sum(z1_normed * z2_normed, axis=-1)
+    invariance_loss = 1.0 - cosine_sim  # [batch, num_tokens]
 
     # jax.debug.print("VICReg dims: B={b}, T={t}, D={d}", b=z1.shape[0], t=z1.shape[1], d=z1.shape[2])
     # jax.debug.print("invariance_loss mean={m}", m=jnp.mean(invariance_loss))
