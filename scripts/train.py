@@ -168,14 +168,14 @@ def train_step(
     model.train()
 
     # Derive effective trainable filter locally (don't rely on config field existence)
-    if getattr(config, "cls_train", False):
-        effective_trainable_filter = nnx.All(
-            nnx.Param,
-            nnx_utils.PathRegex(r".*(pre_cls_param|suf_cls_param|act_cls_proj|obs_cls_proj).*"),
-        )
-        # Also keep model in train mode but frozen parts won't receive grads by DiffState
-    else:
-        effective_trainable_filter = config.trainable_filter
+    # if getattr(config, "cls_train", False):
+    #     effective_trainable_filter = nnx.All(
+    #         nnx.Param,
+    #         nnx_utils.PathRegex(r".*(pre_cls_param|suf_cls_param|act_cls_proj|obs_cls_proj).*"),
+    #     )
+    #     # Also keep model in train mode but frozen parts won't receive grads by DiffState
+    # else:
+    #     effective_trainable_filter = config.trainable_filter
 
     @at.typecheck
     def loss_fn(
@@ -241,27 +241,27 @@ def train_step(
                 if substr in path_to_str(p):
                     c += 1
             return c
-        info["num_params_pre_cls_param"] = count_match("pre_cls_param")
-        info["num_params_suf_cls_param"] = count_match("suf_cls_param")
-        info["num_params_obs_cls_proj"] = count_match("obs_cls_proj")
-        info["num_params_act_cls_proj"] = count_match("act_cls_proj")
+        # info["num_params_pre_cls_param"] = count_match("pre_cls_param")
+        # info["num_params_suf_cls_param"] = count_match("suf_cls_param")
+        # info["num_params_obs_cls_proj"] = count_match("obs_cls_proj")
+        # info["num_params_act_cls_proj"] = count_match("act_cls_proj")
 
         # Check how many params FULLMATCH our regex exactly like PathRegex
-        regex = re.compile(r".*(pre_cls_param|suf_cls_param|act_cls_proj|obs_cls_proj).*")
-        def path_to_str_full(path):
-            # mimic PathRegex joining: str(x) for each element
-            return "/".join(str(x) for x in path)
-        fullmatch_count = 0
-        sample_nonmatch = None
-        for p in p_paths:
-            s = path_to_str_full(p)
-            if regex.fullmatch(s):
-                fullmatch_count += 1
-            elif sample_nonmatch is None and any(k in s for k in ["pre_cls_param","suf_cls_param","obs_cls_proj","act_cls_proj"]):
-                sample_nonmatch = s
-        info["num_params_regex_fullmatch"] = fullmatch_count
-        if sample_nonmatch is not None:
-            info["regex_nonmatch_example"] = sample_nonmatch
+        # regex = re.compile(r".*(pre_cls_param|suf_cls_param|act_cls_proj|obs_cls_proj).*")
+        # def path_to_str_full(path):
+        #     # mimic PathRegex joining: str(x) for each element
+        #     return "/".join(str(x) for x in path)
+        # fullmatch_count = 0
+        # sample_nonmatch = None
+        # for p in p_paths:
+        #     s = path_to_str_full(p)
+        #     if regex.fullmatch(s):
+        #         fullmatch_count += 1
+        #     elif sample_nonmatch is None and any(k in s for k in ["pre_cls_param","suf_cls_param","obs_cls_proj","act_cls_proj"]):
+        #         sample_nonmatch = s
+        # info["num_params_regex_fullmatch"] = fullmatch_count
+        # if sample_nonmatch is not None:
+        #     info["regex_nonmatch_example"] = sample_nonmatch
     except Exception:
         pass
 
@@ -294,14 +294,14 @@ def train_step(
                 continue
             if jnp.any(jnp.not_equal(jnp.asarray(g), 0)):
                 nonzero += 1
-        info["num_nonzero_grad_leaves"] = nonzero
-
-        info["grad_norm_obs_cls_proj"] = grad_norm_for("obs_cls_proj")
-        info["grad_norm_act_cls_proj"] = grad_norm_for("act_cls_proj")
-        info["grad_norm_action_out_proj"] = grad_norm_for("action_out_proj")
-        info["grad_norm_llm"] = grad_norm_for("PaliGemma/llm")
-        info["grad_norm_pre_cls_param"] = grad_norm_for("pre_cls_param")
-        info["grad_norm_suf_cls_param"] = grad_norm_for("suf_cls_param")
+        # info["num_nonzero_grad_leaves"] = nonzero
+        #
+        # info["grad_norm_obs_cls_proj"] = grad_norm_for("obs_cls_proj")
+        # info["grad_norm_act_cls_proj"] = grad_norm_for("act_cls_proj")
+        # info["grad_norm_action_out_proj"] = grad_norm_for("action_out_proj")
+        # info["grad_norm_llm"] = grad_norm_for("PaliGemma/llm")
+        # info["grad_norm_pre_cls_param"] = grad_norm_for("pre_cls_param")
+        # info["grad_norm_suf_cls_param"] = grad_norm_for("suf_cls_param")
     except Exception:
         # Best-effort diagnostics; ignore if structure changes
         pass
