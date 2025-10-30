@@ -216,8 +216,8 @@ class Pi0(_model.BaseModel):
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
 
-        self.obs_cls_proj = MLP(paligemma_config.width, paligemma_config.width, action_expert_config.width, rngs=rngs)
-        self.act_cls_proj = MLP(action_expert_config.width, paligemma_config.width, action_expert_config.width,
+        self.obs_cls_proj = MLP(paligemma_config.width, paligemma_config.width, 256, rngs=rngs)
+        self.act_cls_proj = MLP(action_expert_config.width, paligemma_config.width, 256,
                                 rngs=rngs)
 
         # 添加两个可学习的参数（避免把初始化函数作为模块静态字段）
