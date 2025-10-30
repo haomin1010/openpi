@@ -233,6 +233,9 @@ def train_step(
             c=g_out,
             d=g_llm,
         )
+        print(
+            "grad_norms: obs_cls_proj={g_obs}, act_cls_proj={g_act}, action_out_proj={g_out}, llm={g_llm}",
+        )
     except Exception:
         # Best-effort diagnostics; ignore if structure changes
         pass
