@@ -208,6 +208,14 @@ def train_step(
         "param_norm": optax.global_norm(kernel_params),
     }
 
+    # Quick diagnostics for trainable selection and key grads
+    try:
+        trainable_count = sum(1 for _ in jax.tree_util.tree_leaves(params))
+        info["num_trainable_leaves"] = trainable_count
+    except Exception:
+        print("exe 111111111111")
+        pass
+
     # Additional gradient diagnostics for key submodules
     try:
         paths, leaves = jax.tree_util.tree_flatten_with_path(grads)
@@ -234,6 +242,8 @@ def train_step(
         info["grad_norm_act_cls_proj"] = grad_norm_for("act_cls_proj")
         info["grad_norm_action_out_proj"] = grad_norm_for("action_out_proj")
         info["grad_norm_llm"] = grad_norm_for("PaliGemma/llm")
+        info["grad_norm_pre_cls_param"] = grad_norm_for("pre_cls_param")
+        info["grad_norm_suf_cls_param"] = grad_norm_for("suf_cls_param")
     except Exception:
         # Best-effort diagnostics; ignore if structure changes
         pass
