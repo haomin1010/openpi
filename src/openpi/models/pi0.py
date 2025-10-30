@@ -20,7 +20,7 @@ logger = logging.getLogger("openpi")
 class MLP(nnx.Module):
     def __init__(self, in_dim, hidden_dim, out_dim, *, rngs):
         self.fc1 = nnx.Linear(in_dim, hidden_dim, rngs=rngs)
-        self.fc2 = nnx.Linear(hidden_dim, out_dim, rngs=rngs)
+        self.fc2 = nnx.Linear(hidden_dim, hidden_dim, rngs=rngs)
         self.fc3 = nnx.Linear(hidden_dim, out_dim, rngs=rngs)
         self.activation_1 = jax.nn.relu
         self.activation_2 = jax.nn.relu
@@ -511,8 +511,8 @@ class Pi0(_model.BaseModel):
         vicreg = vicreg_loss(
             obs_cls_out,
             act_cls_out,
-            lambda_param=25.0,
-            mu_param=8.0,
+            lambda_param=8.0,
+            mu_param=25.0,
             nu_param=1.0,
         )
 
