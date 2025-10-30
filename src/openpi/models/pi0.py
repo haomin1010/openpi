@@ -105,19 +105,24 @@ def vicreg_loss(z1, z2, lambda_param=25.0, mu_param=25.0, nu_param=1.0, gamma=1.
 
     # Summarize diagnostics across tokens
     jax.debug.print(
-        "std_mean z1={a}, z2={b}, total={c}",
+        "invariance_loss z1={a}",
+        a=jnp.mean(lambda_param * invariance_loss),
+    )
+
+    jax.debug.print(
+        "std_mean z1={a}, z2={b}, variance_loss={c}",
         a=jnp.mean(jnp.stack(std_means_z1)),
         b=jnp.mean(jnp.stack(std_means_z2)),
-        c=jnp.mean(lambda_param * invariance_loss)
-    )
-    jax.debug.print(
-        "cov_offdiag_ratio z1={a}, z2={b}, total={c}",
-        a=jnp.mean(jnp.stack(cov_offdiag_ratio_z1)),
-        b=jnp.mean(jnp.stack(cov_offdiag_ratio_z2)),
         c=jnp.mean(mu_param * variance_loss)
     )
+    # jax.debug.print(
+    #     "cov_offdiag_ratio z1={a}, z2={b}, total={c}",
+    #     a=jnp.mean(jnp.stack(cov_offdiag_ratio_z1)),
+    #     b=jnp.mean(jnp.stack(cov_offdiag_ratio_z2)),
+    #     c=jnp.mean(mu_param * variance_loss)
+    # )
     jax.debug.print(
-        "cov_loss split mean: z1={a}, z2={b}, total={c}",
+        "cov_loss split mean: z1={a}, z2={b}, covariance_loss={c}",
         a=jnp.mean(jnp.stack(cov_loss_z1_list)),
         b=jnp.mean(jnp.stack(cov_loss_z2_list)),
         c=jnp.mean(nu_param * covariance_loss)
@@ -494,7 +499,7 @@ class Pi0(_model.BaseModel):
             obs_cls_out,
             act_cls_out,
             lambda_param=25.0,
-            mu_param=25.0,
+            mu_param=8.0,
             nu_param=1.0,
         )
 
