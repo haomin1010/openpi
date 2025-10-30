@@ -92,15 +92,10 @@ def init_train_state(
             nnx.Param,
             nnx.Not(nnx_utils.PathRegex(r".*/(pre_cls_param|suf_cls_param|act_cls_proj|obs_cls_proj)(/.*)?")),
         )
-        cls_trainable_only = nnx.All(
-            nnx.Param,
-            nnx_utils.PathRegex(r".*/(pre_cls_param|suf_cls_param|act_cls_proj|obs_cls_proj)(/.*)?"),
-        )
-        # Freeze everything except the CLS-related params and only train those
+        # Freeze everything except the CLS-related params
         config = dataclasses.replace(
             config,
             freeze_filter=cls_exclusive_freeze,
-            trainable_filter=cls_trainable_only,
         )
 
     tx = _optimizer.create_optimizer(config.optimizer, config.lr_schedule, weight_decay_mask=None)
@@ -121,12 +116,21 @@ def init_train_state(
         # Convert frozen params to bfloat16.
         params = nnx_utils.state_map(params, config.freeze_filter, lambda p: p.replace(p.value.astype(jnp.bfloat16)))
 
+        # Determine effective trainable filter (respect cls_train logic)
+        if getattr(config, "cls_train", False):
+            effective_trainable_filter = nnx.All(
+                nnx.Param,
+                nnx_utils.PathRegex(r".*/(pre_cls_param|suf_cls_param|act_cls_proj|obs_cls_proj)(/.*)?"),
+            )
+        else:
+            effective_trainable_filter = config.trainable_filter
+
         return training_utils.TrainState(
             step=0,
             params=params,
             model_def=nnx.graphdef(model),
             tx=tx,
-            opt_state=tx.init(params.filter(config.trainable_filter)),
+            opt_state=tx.init(params.filter(effective_trainable_filter)),
             ema_decay=config.ema_decay,
             ema_params=None if config.ema_decay is None else params,
         )
@@ -161,8 +165,15 @@ def train_step(
     model = nnx.merge(state.model_def, state.params)
     model.train()
 
-    # Use the configured trainable filter (set specially for cls_train in init)
-    effective_trainable_filter = config.trainable_filter
+    # Derive effective trainable filter locally (don't rely on config field existence)
+    if getattr(config, "cls_train", False):
+        effective_trainable_filter = nnx.All(
+            nnx.Param,
+            nnx_utils.PathRegex(r".*/(pre_cls_param|suf_cls_param|act_cls_proj|obs_cls_proj)(/.*)?"),
+        )
+        # Also keep model in train mode but frozen parts won't receive grads by DiffState
+    else:
+        effective_trainable_filter = config.trainable_filter
 
     @at.typecheck
     def loss_fn(
