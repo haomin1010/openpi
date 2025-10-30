@@ -21,11 +21,16 @@ class MLP(nnx.Module):
     def __init__(self, in_dim, hidden_dim, out_dim, *, rngs):
         self.fc1 = nnx.Linear(in_dim, hidden_dim, rngs=rngs)
         self.fc2 = nnx.Linear(hidden_dim, out_dim, rngs=rngs)
-        self.activation = jax.nn.relu
+        self.fc3 = nnx.Linear(hidden_dim, out_dim, rngs=rngs)
+        self.activation_1 = jax.nn.relu
+        self.activation_2 = jax.nn.relu
 
     def __call__(self, x):
-        x = self.activation(self.fc1(x))
+        x = self.activation_1(self.fc1(x))
         x = self.fc2(x)
+        x = self.activation_2(self.fc1(x))
+        x = self.fc3(x)
+
         return x
 
 
