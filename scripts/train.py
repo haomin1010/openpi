@@ -210,16 +210,24 @@ def train_step(
 
     # Additional gradient diagnostics for key submodules
     try:
-        flat_grads = traverse_util.flatten_dict(grads)
+        paths, leaves = jax.tree_util.tree_flatten_with_path(grads)
+
+        def path_to_str(path):
+            parts = []
+            for k in path:
+                # jax.tree_util.Key has attribute `key`; fall back to the object itself
+                parts.append(str(getattr(k, "key", k)))
+            return "/".join(parts)
 
         def grad_norm_for(pattern: str):
-            total = 0.0
-            for kp, g in flat_grads.items():
+            total = jnp.array(0.0, dtype=jnp.float32)
+            for p, g in zip(paths, leaves):
                 if g is None:
                     continue
-                key_str = "/".join(map(str, kp))
+                key_str = path_to_str(p)
                 if pattern in key_str:
-                    total = total + jnp.sum(jnp.square(g))
+                    g32 = jnp.asarray(g, dtype=jnp.float32)
+                    total = total + jnp.sum(jnp.square(g32))
             return jnp.sqrt(total + 1e-12)
 
         info["grad_norm_obs_cls_proj"] = grad_norm_for("obs_cls_proj")
@@ -228,9 +236,7 @@ def train_step(
         info["grad_norm_llm"] = grad_norm_for("PaliGemma/llm")
     except Exception:
         # Best-effort diagnostics; ignore if structure changes
-        #pass
-        print("aaaaaaaaaa1111")
-        jax.debug.print("aaaaaaaa2222")
+        pass
     return new_state, info
 
 
