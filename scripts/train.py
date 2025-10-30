@@ -1,4 +1,5 @@
 import dataclasses
+import re
 import functools
 import logging
 import platform
@@ -88,9 +89,10 @@ def init_train_state(
     # If cls_train is enabled, freeze everything except pre_cls_param and suf_cls_param.
     # This ensures LLM/vision backbones and projection heads are excluded from optimization.
     if getattr(config, "cls_train", False):
+
         cls_exclusive_freeze = nnx.All(
             nnx.Param,
-            nnx.Not(nnx_utils.PathRegex(r".*/(pre_cls_param|suf_cls_param|act_cls_proj|obs_cls_proj)(/.*)?")),
+            nnx.Not(nnx_utils.PathRegex(r".*(pre_cls_param|suf_cls_param|act_cls_proj|obs_cls_proj).*")),
         )
         # Freeze everything except the CLS-related params
         config = dataclasses.replace(
@@ -120,7 +122,7 @@ def init_train_state(
         if getattr(config, "cls_train", False):
             effective_trainable_filter = nnx.All(
                 nnx.Param,
-                nnx_utils.PathRegex(r".*/(pre_cls_param|suf_cls_param|act_cls_proj|obs_cls_proj)(/.*)?"),
+                nnx_utils.PathRegex(r".*(pre_cls_param|suf_cls_param|act_cls_proj|obs_cls_proj).*"),
             )
         else:
             effective_trainable_filter = config.trainable_filter
@@ -169,7 +171,7 @@ def train_step(
     if getattr(config, "cls_train", False):
         effective_trainable_filter = nnx.All(
             nnx.Param,
-            nnx_utils.PathRegex(r".*/(pre_cls_param|suf_cls_param|act_cls_proj|obs_cls_proj)(/.*)?"),
+            nnx_utils.PathRegex(r".*(pre_cls_param|suf_cls_param|act_cls_proj|obs_cls_proj).*"),
         )
         # Also keep model in train mode but frozen parts won't receive grads by DiffState
     else:
@@ -243,6 +245,23 @@ def train_step(
         info["num_params_suf_cls_param"] = count_match("suf_cls_param")
         info["num_params_obs_cls_proj"] = count_match("obs_cls_proj")
         info["num_params_act_cls_proj"] = count_match("act_cls_proj")
+
+        # Check how many params FULLMATCH our regex exactly like PathRegex
+        regex = re.compile(r".*(pre_cls_param|suf_cls_param|act_cls_proj|obs_cls_proj).*")
+        def path_to_str_full(path):
+            # mimic PathRegex joining: str(x) for each element
+            return "/".join(str(x) for x in path)
+        fullmatch_count = 0
+        sample_nonmatch = None
+        for p in p_paths:
+            s = path_to_str_full(p)
+            if regex.fullmatch(s):
+                fullmatch_count += 1
+            elif sample_nonmatch is None and any(k in s for k in ["pre_cls_param","suf_cls_param","obs_cls_proj","act_cls_proj"]):
+                sample_nonmatch = s
+        info["num_params_regex_fullmatch"] = fullmatch_count
+        if sample_nonmatch is not None:
+            info["regex_nonmatch_example"] = sample_nonmatch
     except Exception:
         pass
 
