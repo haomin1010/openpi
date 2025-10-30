@@ -222,20 +222,10 @@ def train_step(
                     total = total + jnp.sum(jnp.square(g))
             return jnp.sqrt(total + 1e-12)
 
-        g_obs = grad_norm_for("obs_cls_proj")
-        g_act = grad_norm_for("act_cls_proj")
-        g_out = grad_norm_for("action_out_proj")
-        g_llm = grad_norm_for("PaliGemma/llm")
-        jax.debug.print(
-            "grad_norms: obs_cls_proj={a}, act_cls_proj={b}, action_out_proj={c}, llm={d}",
-            a=g_obs,
-            b=g_act,
-            c=g_out,
-            d=g_llm,
-        )
-        print(
-            "grad_norms: obs_cls_proj={g_obs}, act_cls_proj={g_act}, action_out_proj={g_out}, llm={g_llm}",
-        )
+        info["grad_norm_obs_cls_proj"] = grad_norm_for("obs_cls_proj")
+        info["grad_norm_act_cls_proj"] = grad_norm_for("act_cls_proj")
+        info["grad_norm_action_out_proj"] = grad_norm_for("action_out_proj")
+        info["grad_norm_llm"] = grad_norm_for("PaliGemma/llm")
     except Exception:
         # Best-effort diagnostics; ignore if structure changes
         pass
