@@ -207,6 +207,32 @@ def train_step(
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
     }
+
+    # Additional gradient diagnostics for key submodules
+    try:
+        flat_grads = traverse_util.flatten_dict(grads)
+
+        def grad_norm_for(pattern: str):
+            total = 0.0
+            for kp, g in flat_grads.items():
+                if g is None:
+                    continue
+                key_str = "/".join(map(str, kp))
+                if pattern in key_str:
+                    total = total + jnp.sum(jnp.square(g))
+            return jnp.sqrt(total + 1e-12)
+
+        info.update(
+            dict(
+                grad_norm_obs_cls_proj=grad_norm_for("obs_cls_proj"),
+                grad_norm_act_cls_proj=grad_norm_for("act_cls_proj"),
+                grad_norm_action_out_proj=grad_norm_for("action_out_proj"),
+                grad_norm_llm=grad_norm_for("PaliGemma/llm"),
+            )
+        )
+    except Exception:
+        # Best-effort diagnostics; ignore if structure changes
+        pass
     return new_state, info
 
 
