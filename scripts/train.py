@@ -228,7 +228,9 @@ def train_step(
         info["grad_norm_llm"] = grad_norm_for("PaliGemma/llm")
     except Exception:
         # Best-effort diagnostics; ignore if structure changes
-        pass
+        #pass
+        print("aaaaaaaaaa1111")
+        jax.debug.print("aaaaaaaa2222")
     return new_state, info
 
 
