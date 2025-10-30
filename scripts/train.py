@@ -92,7 +92,16 @@ def init_train_state(
             nnx.Param,
             nnx.Not(nnx_utils.PathRegex(r".*/(pre_cls_param|suf_cls_param|act_cls_proj|obs_cls_proj)(/.*)?")),
         )
-        config = dataclasses.replace(config, freeze_filter=cls_exclusive_freeze)
+        cls_trainable_only = nnx.All(
+            nnx.Param,
+            nnx_utils.PathRegex(r".*/(pre_cls_param|suf_cls_param|act_cls_proj|obs_cls_proj)(/.*)?"),
+        )
+        # Freeze everything except the CLS-related params and only train those
+        config = dataclasses.replace(
+            config,
+            freeze_filter=cls_exclusive_freeze,
+            trainable_filter=cls_trainable_only,
+        )
 
     tx = _optimizer.create_optimizer(config.optimizer, config.lr_schedule, weight_decay_mask=None)
 
@@ -152,15 +161,8 @@ def train_step(
     model = nnx.merge(state.model_def, state.params)
     model.train()
 
-    # Ensure we use the same trainable filter as during optimizer init when cls_train is enabled.
-    if getattr(config, "cls_train", False):
-        cls_exclusive_freeze = nnx.All(
-            nnx.Param,
-            nnx.Not(nnx_utils.PathRegex(r".*/(pre_cls_param|suf_cls_param|act_cls_proj|obs_cls_proj)(/.*)?")),
-        )
-        effective_trainable_filter = nnx.All(nnx.Param, nnx.Not(cls_exclusive_freeze))
-    else:
-        effective_trainable_filter = config.trainable_filter
+    # Use the configured trainable filter (set specially for cls_train in init)
+    effective_trainable_filter = config.trainable_filter
 
     @at.typecheck
     def loss_fn(
@@ -212,8 +214,25 @@ def train_step(
     try:
         trainable_count = sum(1 for _ in jax.tree_util.tree_leaves(params))
         info["num_trainable_leaves"] = trainable_count
+        # Count matches for each CLS pattern to verify path regex
+        p_paths, p_leaves = jax.tree_util.tree_flatten_with_path(state.params)
+        def path_to_str(path):
+            parts = [str(getattr(k, "key", k)) for k in path]
+            return "/".join(parts)
+        def count_match(substr: str):
+            c = 0
+            for p, leaf in zip(p_paths, jax.tree_util.tree_leaves(state.params)):
+                # iterate over leaves again for alignment safety
+                if leaf is None:
+                    continue
+                if substr in path_to_str(p):
+                    c += 1
+            return c
+        info["num_params_pre_cls_param"] = count_match("pre_cls_param")
+        info["num_params_suf_cls_param"] = count_match("suf_cls_param")
+        info["num_params_obs_cls_proj"] = count_match("obs_cls_proj")
+        info["num_params_act_cls_proj"] = count_match("act_cls_proj")
     except Exception:
-        print("exe 111111111111")
         pass
 
     # Additional gradient diagnostics for key submodules
@@ -237,6 +256,15 @@ def train_step(
                     g32 = jnp.asarray(g, dtype=jnp.float32)
                     total = total + jnp.sum(jnp.square(g32))
             return jnp.sqrt(total + 1e-12)
+
+        # How many gradient leaves are non-zero (within tolerance)?
+        nonzero = 0
+        for g in leaves:
+            if g is None:
+                continue
+            if jnp.any(jnp.not_equal(jnp.asarray(g), 0)):
+                nonzero += 1
+        info["num_nonzero_grad_leaves"] = nonzero
 
         info["grad_norm_obs_cls_proj"] = grad_norm_for("obs_cls_proj")
         info["grad_norm_act_cls_proj"] = grad_norm_for("act_cls_proj")
