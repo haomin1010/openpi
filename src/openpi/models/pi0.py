@@ -22,13 +22,12 @@ class MLP(nnx.Module):
         self.fc1 = nnx.Linear(in_dim, hidden_dim, rngs=rngs)
         self.fc2 = nnx.Linear(hidden_dim, hidden_dim, rngs=rngs)
         self.fc3 = nnx.Linear(hidden_dim, out_dim, rngs=rngs)
-        self.activation_1 = jax.nn.relu
-        self.activation_2 = jax.nn.relu
+        self.activation_1 = nnx.swish
+        self.activation_2 = nnx.swish
 
     def __call__(self, x):
         x = self.activation_1(self.fc1(x))
-        x = self.fc2(x)
-        x = self.activation_2(self.fc1(x))
+        x = self.activation_2(self.fc2(x))
         x = self.fc3(x)
 
         return x
@@ -244,6 +243,10 @@ class Pi0(_model.BaseModel):
         # 添加两个可学习的参数（避免把初始化函数作为模块静态字段）
         self.pre_cls_param = nnx.Param(nnx.initializers.normal()(rngs(), (1, 2, paligemma_config.width)))
         self.suf_cls_param = nnx.Param(nnx.initializers.normal()(rngs(), (1, 2, action_expert_config.width)))
+
+        # Learnable temperatures to scale CLS heads before VICReg
+        self.obs_cls_temp = nnx.Param(jnp.array(1.0, dtype=jnp.float32))
+        self.act_cls_temp = nnx.Param(jnp.array(1.0, dtype=jnp.float32))
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
@@ -505,8 +508,8 @@ class Pi0(_model.BaseModel):
             length=num_steps,
         )
 
-        obs_cls_out = self.obs_cls_proj(prefix_out[:, :2, :])
-        act_cls_out = self.act_cls_proj(suffix_out[:, -2:, :])
+        obs_cls_out = self.obs_cls_proj(prefix_out[:, :2, :]) * self.obs_cls_temp.value
+        act_cls_out = self.act_cls_proj(suffix_out[:, -2:, :]) * self.act_cls_temp.value
 
         vicreg = vicreg_loss(
             obs_cls_out,
