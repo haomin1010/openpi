@@ -194,28 +194,35 @@ def train_step(
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
 
     # Update diagnostics to verify parameter changes will occur
+    update_norm_for = None
+    num_nonzero_update_leaves = 0
     try:
-        up_paths, up_leaves = jax.tree_util.tree_flatten_with_path(updates)
-        def path_to_str_u(path):
-            return "/".join(str(getattr(k, "key", k)) for k in path)
-        def update_norm_for(pattern: str):
-            total = jnp.array(0.0, dtype=jnp.float32)
-            for p, u in zip(up_paths, up_leaves):
-                if u is None:
-                    continue
-                if pattern in path_to_str_u(p):
-                    u32 = jnp.asarray(u, dtype=jnp.float32)
-                    total = total + jnp.sum(jnp.square(u32))
-            return jnp.sqrt(total + 1e-12)
-        num_nonzero_update_leaves = 0
-        for u in up_leaves:
+        # Count nonzero leaves using a robust leaf-only path first
+        only_leaves = jax.tree_util.tree_leaves(updates)
+        for u in only_leaves:
             if u is None:
                 continue
             if jnp.any(jnp.not_equal(jnp.asarray(u), 0)):
                 num_nonzero_update_leaves += 1
+
+        # If path flatten works, enable per-pattern norms
+        try:
+            up_paths, up_leaves = jax.tree_util.tree_flatten_with_path(updates)
+            def path_to_str_u(path):
+                return "/".join(str(getattr(k, "key", k)) for k in path)
+            def update_norm_for(pattern: str):
+                total = jnp.array(0.0, dtype=jnp.float32)
+                for p, u in zip(up_paths, up_leaves):
+                    if u is None:
+                        continue
+                    if pattern in path_to_str_u(p):
+                        u32 = jnp.asarray(u, dtype=jnp.float32)
+                        total = total + jnp.sum(jnp.square(u32))
+                return jnp.sqrt(total + 1e-12)
+        except Exception:
+            update_norm_for = None
     except Exception:
-        update_norm_for = None
-        num_nonzero_update_leaves = None
+        num_nonzero_update_leaves = 0
 
     new_params = optax.apply_updates(params, updates)
 
@@ -248,100 +255,106 @@ def train_step(
     }
 
     # Attach update diagnostics
-    try:
-        info["update_norm"] = optax.global_norm(updates)
-        if num_nonzero_update_leaves is not None:
-            info["num_nonzero_update_leaves"] = num_nonzero_update_leaves
-        if update_norm_for is not None:
-            info["update_norm_pre_cls_param"] = update_norm_for("pre_cls_param")
-            info["update_norm_suf_cls_param"] = update_norm_for("suf_cls_param")
-            info["update_norm_obs_cls_proj"] = update_norm_for("obs_cls_proj")
-            info["update_norm_act_cls_proj"] = update_norm_for("act_cls_proj")
-    except Exception:
-        pass
-
-    # Quick diagnostics for trainable selection and key grads
-    try:
-        trainable_count = sum(1 for _ in jax.tree_util.tree_leaves(params))
-        info["num_trainable_leaves"] = trainable_count
-        # Count matches for each CLS pattern to verify path regex
-        p_paths, p_leaves = jax.tree_util.tree_flatten_with_path(state.params)
-        def path_to_str(path):
-            parts = [str(getattr(k, "key", k)) for k in path]
-            return "/".join(parts)
-        def count_match(substr: str):
-            c = 0
-            for p, leaf in zip(p_paths, jax.tree_util.tree_leaves(state.params)):
-                # iterate over leaves again for alignment safety
-                if leaf is None:
-                    continue
-                if substr in path_to_str(p):
-                    c += 1
-            return c
-        info["num_params_pre_cls_param"] = count_match("pre_cls_param")
-        info["num_params_suf_cls_param"] = count_match("suf_cls_param")
-        info["num_params_obs_cls_proj"] = count_match("obs_cls_proj")
-        info["num_params_act_cls_proj"] = count_match("act_cls_proj")
-
-        # Check how many params FULLMATCH our regex exactly like PathRegex
-        regex = re.compile(r".*(pre_cls_param|suf_cls_param|act_cls_proj|obs_cls_proj).*")
-        def path_to_str_full(path):
-            # mimic PathRegex joining: str(x) for each element
-            return "/".join(str(x) for x in path)
-        fullmatch_count = 0
-        sample_nonmatch = None
-        for p in p_paths:
-            s = path_to_str_full(p)
-            if regex.fullmatch(s):
-                fullmatch_count += 1
-            elif sample_nonmatch is None and any(k in s for k in ["pre_cls_param","suf_cls_param","obs_cls_proj","act_cls_proj"]):
-                sample_nonmatch = s
-        info["num_params_regex_fullmatch"] = fullmatch_count
-        if sample_nonmatch is not None:
-            info["regex_nonmatch_example"] = sample_nonmatch
-    except Exception:
-        pass
-
-    # Additional gradient diagnostics for key submodules
-    try:
-        paths, leaves = jax.tree_util.tree_flatten_with_path(grads)
-
-        def path_to_str(path):
-            parts = []
-            for k in path:
-                # jax.tree_util.Key has attribute `key`; fall back to the object itself
-                parts.append(str(getattr(k, "key", k)))
-            return "/".join(parts)
-
-        def grad_norm_for(pattern: str):
-            total = jnp.array(0.0, dtype=jnp.float32)
-            for p, g in zip(paths, leaves):
-                if g is None:
-                    continue
-                key_str = path_to_str(p)
-                if pattern in key_str:
-                    g32 = jnp.asarray(g, dtype=jnp.float32)
-                    total = total + jnp.sum(jnp.square(g32))
-            return jnp.sqrt(total + 1e-12)
-
-        # How many gradient leaves are non-zero (within tolerance)?
-        nonzero = 0
-        for g in leaves:
-            if g is None:
-                continue
-            if jnp.any(jnp.not_equal(jnp.asarray(g), 0)):
-                nonzero += 1
-        info["num_nonzero_grad_leaves"] = nonzero
-
-        info["grad_norm_obs_cls_proj"] = grad_norm_for("obs_cls_proj")
-        info["grad_norm_act_cls_proj"] = grad_norm_for("act_cls_proj")
-        info["grad_norm_action_out_proj"] = grad_norm_for("action_out_proj")
-        info["grad_norm_llm"] = grad_norm_for("PaliGemma/llm")
-        info["grad_norm_pre_cls_param"] = grad_norm_for("pre_cls_param")
-        info["grad_norm_suf_cls_param"] = grad_norm_for("suf_cls_param")
-    except Exception:
-        # Best-effort diagnostics; ignore if structure changes
-        pass
+    # try:
+    #     info["update_norm"] = optax.global_norm(updates)
+    #     info["num_nonzero_update_leaves"] = num_nonzero_update_leaves
+    #     if update_norm_for is not None:
+    #         info["update_norm_pre_cls_param"] = update_norm_for("pre_cls_param")
+    #         info["update_norm_suf_cls_param"] = update_norm_for("suf_cls_param")
+    #         info["update_norm_obs_cls_proj"] = update_norm_for("obs_cls_proj")
+    #         info["update_norm_act_cls_proj"] = update_norm_for("act_cls_proj")
+    # except Exception:
+    #     pass
+    #
+    # # Quick diagnostics for trainable selection and key grads
+    # try:
+    #     # Log current learning rate (helps explain tiny updates during warmup)
+    #     try:
+    #         current_lr = config.lr_schedule.create()(state.step)
+    #         info["current_lr"] = current_lr
+    #     except Exception:
+    #         pass
+    #
+    #     trainable_count = sum(1 for _ in jax.tree_util.tree_leaves(params))
+    #     info["num_trainable_leaves"] = trainable_count
+    #     # Count matches for each CLS pattern to verify path regex
+    #     p_paths, p_leaves = jax.tree_util.tree_flatten_with_path(state.params)
+    #     def path_to_str(path):
+    #         parts = [str(getattr(k, "key", k)) for k in path]
+    #         return "/".join(parts)
+    #     def count_match(substr: str):
+    #         c = 0
+    #         for p, leaf in zip(p_paths, jax.tree_util.tree_leaves(state.params)):
+    #             # iterate over leaves again for alignment safety
+    #             if leaf is None:
+    #                 continue
+    #             if substr in path_to_str(p):
+    #                 c += 1
+    #         return c
+    #     info["num_params_pre_cls_param"] = count_match("pre_cls_param")
+    #     info["num_params_suf_cls_param"] = count_match("suf_cls_param")
+    #     info["num_params_obs_cls_proj"] = count_match("obs_cls_proj")
+    #     info["num_params_act_cls_proj"] = count_match("act_cls_proj")
+    #
+    #     # Check how many params FULLMATCH our regex exactly like PathRegex
+    #     regex = re.compile(r".*(pre_cls_param|suf_cls_param|act_cls_proj|obs_cls_proj).*")
+    #     def path_to_str_full(path):
+    #         # mimic PathRegex joining: str(x) for each element
+    #         return "/".join(str(x) for x in path)
+    #     fullmatch_count = 0
+    #     sample_nonmatch = None
+    #     for p in p_paths:
+    #         s = path_to_str_full(p)
+    #         if regex.fullmatch(s):
+    #             fullmatch_count += 1
+    #         elif sample_nonmatch is None and any(k in s for k in ["pre_cls_param","suf_cls_param","obs_cls_proj","act_cls_proj"]):
+    #             sample_nonmatch = s
+    #     info["num_params_regex_fullmatch"] = fullmatch_count
+    #     if sample_nonmatch is not None:
+    #         info["regex_nonmatch_example"] = sample_nonmatch
+    # except Exception:
+    #     pass
+    #
+    # # Additional gradient diagnostics for key submodules
+    # try:
+    #     paths, leaves = jax.tree_util.tree_flatten_with_path(grads)
+    #
+    #     def path_to_str(path):
+    #         parts = []
+    #         for k in path:
+    #             # jax.tree_util.Key has attribute `key`; fall back to the object itself
+    #             parts.append(str(getattr(k, "key", k)))
+    #         return "/".join(parts)
+    #
+    #     def grad_norm_for(pattern: str):
+    #         total = jnp.array(0.0, dtype=jnp.float32)
+    #         for p, g in zip(paths, leaves):
+    #             if g is None:
+    #                 continue
+    #             key_str = path_to_str(p)
+    #             if pattern in key_str:
+    #                 g32 = jnp.asarray(g, dtype=jnp.float32)
+    #                 total = total + jnp.sum(jnp.square(g32))
+    #         return jnp.sqrt(total + 1e-12)
+    #
+    #     # How many gradient leaves are non-zero (within tolerance)?
+    #     nonzero = 0
+    #     for g in leaves:
+    #         if g is None:
+    #             continue
+    #         if jnp.any(jnp.not_equal(jnp.asarray(g), 0)):
+    #             nonzero += 1
+    #     info["num_nonzero_grad_leaves"] = nonzero
+    #
+    #     info["grad_norm_obs_cls_proj"] = grad_norm_for("obs_cls_proj")
+    #     info["grad_norm_act_cls_proj"] = grad_norm_for("act_cls_proj")
+    #     info["grad_norm_action_out_proj"] = grad_norm_for("action_out_proj")
+    #     info["grad_norm_llm"] = grad_norm_for("PaliGemma/llm")
+    #     info["grad_norm_pre_cls_param"] = grad_norm_for("pre_cls_param")
+    #     info["grad_norm_suf_cls_param"] = grad_norm_for("suf_cls_param")
+    # except Exception:
+    #     # Best-effort diagnostics; ignore if structure changes
+    #     pass
     return new_state, info
 
 
