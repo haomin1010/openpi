@@ -601,7 +601,15 @@ class Pi0(_model.BaseModel):
             return x_t, time
 
         if old_obs_cls_head is not None:
-            should_sample = jnp.mean(jnp.sum(obs_cls_heads[:, 1, :] * old_obs_cls_head, axis=-1)) < 0.5
+            z1_l2 = jnp.linalg.norm(obs_cls_heads[:, 1, :], axis=-1, keepdims=True)
+            z2_l2 = jnp.linalg.norm(old_obs_cls_head, axis=-1, keepdims=True)
+            z1_normed = obs_cls_heads / (z1_l2 + 1e-4)
+            z2_normed = old_obs_cls_head / (z2_l2 + 1e-4)
+            # Use cosine distance: 1 - cosine_similarity, stable across dimensionality.
+            cosine_sim = jnp.sum(z1_normed * z2_normed, axis=-1)
+            invariance_loss = 1.0 - cosine_sim
+            should_sample = invariance_loss < 0.5
+            jax.debug.print("invariance_loss={a}", a=invariance_loss)
         else:
             # If old_obs_cls_head is None, always sample
             should_sample = jnp.array(True)
