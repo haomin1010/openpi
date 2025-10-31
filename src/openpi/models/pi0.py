@@ -75,6 +75,10 @@ def vicreg_loss(z1, z2, lambda_param=25.0, mu_param=25.0, nu_param=1.0, gamma=1.
     # row_cosine: [BT, BT] = 256x256 when B=128, T=2
     row_cosine = jnp.matmul(z1_bt_norm, z2_bt_norm.T)
     matrix_row_cosine_mean = jnp.mean(row_cosine)
+    # Diagonal and off-diagonal means to assess alignment vs collapse
+    bt = row_cosine.shape[0]
+    diag_mean = jnp.mean(jnp.diag(row_cosine))
+    offdiag_mean = jnp.sum(row_cosine * (1.0 - jnp.eye(bt))) / (bt * bt - bt)
 
     # jax.debug.print("VICReg dims: B={b}, T={t}, D={d}", b=z1.shape[0], t=z1.shape[1], d=z1.shape[2])
     # jax.debug.print("invariance_loss mean={m}", m=jnp.mean(invariance_loss))
@@ -141,6 +145,11 @@ def vicreg_loss(z1, z2, lambda_param=25.0, mu_param=25.0, nu_param=1.0, gamma=1.
     jax.debug.print(
         "matrix_row_cosine_mean={a}",
         a=matrix_row_cosine_mean,
+    )
+    jax.debug.print(
+        "pairwise diag_mean={a}, offdiag_mean={b}",
+        a=diag_mean,
+        b=offdiag_mean,
     )
 
     jax.debug.print(
