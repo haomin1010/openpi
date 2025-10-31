@@ -22,16 +22,23 @@ class MLP(nnx.Module):
         self.fc1 = nnx.Linear(in_dim, hidden_dim, rngs=rngs)
         self.fc2 = nnx.Linear(hidden_dim, hidden_dim, rngs=rngs)
         self.fc3 = nnx.Linear(hidden_dim, hidden_dim, rngs=rngs)
-        self.fc4 = nnx.Linear(hidden_dim, out_dim, rngs=rngs)
+        self.fc4 = nnx.Linear(hidden_dim, hidden_dim, rngs=rngs)
+        self.fc5 = nnx.Linear(hidden_dim, hidden_dim, rngs=rngs)
+        self.fc6 = nnx.Linear(hidden_dim, out_dim, rngs=rngs)
+
         self.activation_1 = nnx.swish
         self.activation_2 = nnx.swish
         self.activation_3 = nnx.swish
+        self.activation_4 = nnx.swish
+        self.activation_5 = nnx.swish
 
     def __call__(self, x):
         x = self.activation_1(self.fc1(x))
         x = self.activation_2(self.fc2(x))
         x = self.activation_3(self.fc3(x))
-        x = self.fc4(x)
+        x = self.activation_4(self.fc4(x))
+        x = self.activation_5(self.fc5(x))
+        x = self.fc6(x)
 
         return x
 
@@ -545,7 +552,7 @@ class Pi0(_model.BaseModel):
         vicreg = vicreg_loss(
             obs_cls_out,
             act_cls_out,
-            lambda_param=25.0,
+            lambda_param=0.0,
             mu_param=50.0,
             nu_param=2.0,
             gamma=gamma,
