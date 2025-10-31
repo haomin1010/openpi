@@ -94,7 +94,7 @@ class Policy(BasePolicy):
             if hasattr(self._model, 'suf_cls_param') and hasattr(self._model.suf_cls_param, 'value'):
                 cls_dim = self._model.suf_cls_param.value.shape[2]
                 cls_dtype = self._model.suf_cls_param.value.dtype
-                self.old_cls_head = jnp.zeros((observation.state.shape[0], cls_dim), dtype=cls_dtype)
+                self.old_cls_head = jnp.zeros((observation.state.shape[0], 256), dtype=cls_dtype)
 
         sample_kwargs["old_obs_cls_head"] = self.old_cls_head
 
