@@ -381,7 +381,7 @@ class Pi0(_model.BaseModel):
 
     @override
     def compute_loss(
-            self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False, cls_train: bool = False
+            self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False, cls_train: bool = False, gamma: float = 1.0
     ) -> at.Float[at.Array, "*b ah"]:
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
 
@@ -414,7 +414,7 @@ class Pi0(_model.BaseModel):
         return jnp.mean(jnp.square(v_t - u_t), axis=-1)
 
     def _compute_cls_loss_with_frozen_params(
-            self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions,
+            self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, gamma: float = 1.0
     ) -> at.Float[at.Array, "*b"]:
         """Compute cls loss with all parameters frozen except pre_cls_param and suf_cls_param.
 
@@ -548,7 +548,7 @@ class Pi0(_model.BaseModel):
             lambda_param=25.0,
             mu_param=50.0,
             nu_param=2.0,
-            gamma=0.8,
+            gamma=gamma,
         )
 
         # jax.debug.print("act_cls_heads sample={x}", x=act_cls_out[0, 0, :])

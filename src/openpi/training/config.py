@@ -468,6 +468,8 @@ class TrainConfig:
 
     frozen: bool = False
 
+    vic_gamma: float = 1.0
+
     # Defines the model config. Some attributes (action_dim, action_horizon, and max_token_len) are shared by all models
     # -- see BaseModelConfig. Specific model implementations (e.g., Pi0Config) inherit from BaseModelConfig and may
     # define additional attributes.
