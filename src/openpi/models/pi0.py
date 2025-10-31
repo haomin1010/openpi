@@ -138,9 +138,9 @@ def vicreg_loss(z1, z2, lambda_param=25.0, mu_param=25.0, nu_param=1.0, gamma=1.
         covariance_losses.append(cov_loss)
 
     variance_loss = jnp.stack(variance_losses)
-    #jax.debug.print("variance_loss per-token mean={m}", m=jnp.mean(variance_loss))
+    # jax.debug.print("variance_loss per-token mean={m}", m=jnp.mean(variance_loss))
     covariance_loss = jnp.stack(covariance_losses)
-    #jax.debug.print("covariance_loss per-token mean={m}", m=jnp.mean(covariance_loss))
+    # jax.debug.print("covariance_loss per-token mean={m}", m=jnp.mean(covariance_loss))
 
     # Summarize diagnostics across tokens
     jax.debug.print(
@@ -274,8 +274,8 @@ class Pi0(_model.BaseModel):
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
 
-        self.obs_cls_proj = MLP(paligemma_config.width, 2*paligemma_config.width, 256, rngs=rngs)
-        self.act_cls_proj = MLP(action_expert_config.width, 2*paligemma_config.width, 256,
+        self.obs_cls_proj = MLP(paligemma_config.width, 2 * paligemma_config.width, 256, rngs=rngs)
+        self.act_cls_proj = MLP(action_expert_config.width, 2 * paligemma_config.width, 256,
                                 rngs=rngs)
 
         # 添加两个可学习的参数（避免把初始化函数作为模块静态字段）
@@ -388,7 +388,8 @@ class Pi0(_model.BaseModel):
 
     @override
     def compute_loss(
-            self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False, cls_train: bool = False, gamma: float = 1.0
+            self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *,
+            train: bool = False, cls_train: bool = False, gamma: float = 1.0
     ) -> at.Float[at.Array, "*b ah"]:
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
 
@@ -421,7 +422,8 @@ class Pi0(_model.BaseModel):
         return jnp.mean(jnp.square(v_t - u_t), axis=-1)
 
     def _compute_cls_loss_with_frozen_params(
-            self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, gamma: float = 1.0
+            self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, gamma: float = 1.0,
+            t_step: float = 0.0
     ) -> at.Float[at.Array, "*b"]:
         """Compute cls loss with all parameters frozen except pre_cls_param and suf_cls_param.
 
@@ -552,9 +554,9 @@ class Pi0(_model.BaseModel):
         vicreg = vicreg_loss(
             obs_cls_out,
             act_cls_out,
-            lambda_param=0.0,
+            lambda_param=25*jax.nn.sigmoid(t_step/300-3),
             mu_param=50.0,
-            nu_param=2.0,
+            nu_param=0.5,
             gamma=gamma,
         )
 
@@ -563,7 +565,7 @@ class Pi0(_model.BaseModel):
         # jax.debug.print("actions sample={x}", x=actions[0, 0, :])
         # jax.debug.print("shape={x}", x=act_cls_out.shape)
         act_loss = jnp.mean(jnp.mean(jnp.square(x_t_final - actions), axis=-1), axis=-1)
-        #jax.debug.print("act_loss={a}", a=jnp.mean(act_loss))
+        jax.debug.print("act_loss={a}", a=jnp.mean(act_loss))
         return jnp.mean(vicreg, axis=-1) + act_loss
 
     @override

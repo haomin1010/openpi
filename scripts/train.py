@@ -180,7 +180,7 @@ def train_step(
     def loss_fn(
         model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
     ):
-        chunked_loss = model.compute_loss(rng, observation, actions, train=True, cls_train=config.cls_train, gamma=config.vic_gamma)
+        chunked_loss = model.compute_loss(rng, observation, actions, train=True, cls_train=config.cls_train, gamma=config.vic_gamma, t_step=state.step)
         return jnp.mean(chunked_loss)
 
     train_rng = jax.random.fold_in(rng, state.step)
