@@ -466,7 +466,7 @@ class TrainConfig:
     # Training code may set a restrictive freeze_filter when this is enabled.
     cls_train: bool = False
 
-    frozen: bool = True
+    frozen: bool = False
 
     # Defines the model config. Some attributes (action_dim, action_horizon, and max_token_len) are shared by all models
     # -- see BaseModelConfig. Specific model implementations (e.g., Pi0Config) inherit from BaseModelConfig and may
