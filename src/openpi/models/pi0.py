@@ -536,9 +536,9 @@ class Pi0(_model.BaseModel):
         vicreg = vicreg_loss(
             obs_cls_out,
             act_cls_out,
-            lambda_param=0.0,
-            mu_param=40.0,
-            nu_param=10.0,
+            lambda_param=25.0,
+            mu_param=50.0,
+            nu_param=2.0,
         )
 
         # jax.debug.print("act_cls_heads sample={x}", x=act_cls_out[0, 0, :])
