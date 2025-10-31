@@ -389,13 +389,13 @@ class Pi0(_model.BaseModel):
     @override
     def compute_loss(
             self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *,
-            train: bool = False, cls_train: bool = False, gamma: float = 1.0
+            train: bool = False, cls_train: bool = False, gamma: float = 1.0, t_step: float= 0.0
     ) -> at.Float[at.Array, "*b ah"]:
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
 
         if cls_train:
             # Use dedicated function that freezes all params except pre_cls_param and suf_cls_param
-            return self._compute_cls_loss_with_frozen_params(rng, observation, actions)
+            return self._compute_cls_loss_with_frozen_params(rng, observation, actions, gamma, t_step)
 
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
 
