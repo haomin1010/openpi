@@ -538,7 +538,7 @@ class Pi0(_model.BaseModel):
             num_steps: int | at.Int[at.Array, ""] = 10,
             noise: at.Float[at.Array, "b ah ad"] | None = None,
             old_obs_cls_head: at.Float[at.Array, "hd"] = None,
-    ) -> (_model.Actions, at.Float[at.Array, "b hd"]):
+    ) -> (_model.Actions, at.Float[at.Array, "hd"]):
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
@@ -600,17 +600,18 @@ class Pi0(_model.BaseModel):
             x_t, time = carry
             return x_t, time
 
+        new_obs_cls_heads = obs_cls_heads[0, 0, :]
         if old_obs_cls_head is not None:
-            z1_l2 = jnp.linalg.norm(obs_cls_heads[0, 0, :], axis=-1, keepdims=True)
+            z1_l2 = jnp.linalg.norm(new_obs_cls_heads, axis=-1, keepdims=True)
             z2_l2 = jnp.linalg.norm(old_obs_cls_head, axis=-1, keepdims=True)
-            z1_normed = obs_cls_heads / (z1_l2 + 1e-4)
+            z1_normed = new_obs_cls_heads / (z1_l2 + 1e-4)
             z2_normed = old_obs_cls_head / (z2_l2 + 1e-4)
             # Use cosine distance: 1 - cosine_similarity, stable across dimensionality.
             cosine_sim = jnp.sum(z1_normed * z2_normed, axis=-1)
-            invariance_loss = 1.0 - cosine_sim
-            should_sample = invariance_loss < 0.5
-            jax.debug.print("invariance_loss={a}", a=obs_cls_heads.shape)
-            jax.debug.print("invariance_loss={a}", a=invariance_loss)
+            should_sample = cosine_sim < 0.5
+            jax.debug.print("cosine_sim={a}", a=cosine_sim)
+            jax.debug.print("z1_normed={a}", a=z1_normed)
+            jax.debug.print("z2_normed={a}", a=z2_normed)
         else:
             # If old_obs_cls_head is None, always sample
             should_sample = jnp.array(True)
