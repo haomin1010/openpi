@@ -63,6 +63,19 @@ def vicreg_loss(z1, z2, lambda_param=25.0, mu_param=25.0, nu_param=1.0, gamma=1.
     cosine_sim = jnp.sum(z1_normed * z2_normed, axis=-1)
     invariance_loss = 1.0 - cosine_sim  # [batch, num_tokens]
 
+    # Additional diagnostic: reshape to (batch*num_tokens, dim) and compute
+    # full pairwise cosine similarity matrix between all rows of z1 and z2,
+    # then average to a scalar.
+    z1_bt = jnp.reshape(z1, (-1, dim))
+    z2_bt = jnp.reshape(z2, (-1, dim))
+    z1_bt_l2 = jnp.linalg.norm(z1_bt, axis=-1, keepdims=True)
+    z2_bt_l2 = jnp.linalg.norm(z2_bt, axis=-1, keepdims=True)
+    z1_bt_norm = z1_bt / (z1_bt_l2 + eps)
+    z2_bt_norm = z2_bt / (z2_bt_l2 + eps)
+    # row_cosine: [BT, BT] = 256x256 when B=128, T=2
+    row_cosine = jnp.matmul(z1_bt_norm, z2_bt_norm.T)
+    matrix_row_cosine_mean = jnp.mean(row_cosine)
+
     # jax.debug.print("VICReg dims: B={b}, T={t}, D={d}", b=z1.shape[0], t=z1.shape[1], d=z1.shape[2])
     # jax.debug.print("invariance_loss mean={m}", m=jnp.mean(invariance_loss))
 
@@ -122,6 +135,12 @@ def vicreg_loss(z1, z2, lambda_param=25.0, mu_param=25.0, nu_param=1.0, gamma=1.
     jax.debug.print(
         "invariance_loss z1={a}",
         a=jnp.mean(lambda_param * invariance_loss),
+    )
+
+    # Log the added matrix-level cosine similarity diagnostic
+    jax.debug.print(
+        "matrix_row_cosine_mean={a}",
+        a=matrix_row_cosine_mean,
     )
 
     jax.debug.print(
