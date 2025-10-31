@@ -546,8 +546,8 @@ class Pi0(_model.BaseModel):
         # jax.debug.print("obs_cls_heads sample={x}", x=obs_cls_out[0, 0, :])
         # jax.debug.print("actions sample={x}", x=actions[0, 0, :])
         # jax.debug.print("shape={x}", x=act_cls_out.shape)
-
-        return jnp.mean(vicreg, axis=-1)
+        act_loss = jnp.mean(jnp.square(x_t_final[:, :-2, :] - actions), axis=-1)
+        return jnp.mean(vicreg, axis=-1) + act_loss
 
     @override
     def sample_actions(

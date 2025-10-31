@@ -88,7 +88,7 @@ def init_train_state(
 ) -> tuple[training_utils.TrainState, Any]:
     # If cls_train is enabled, freeze everything except pre_cls_param and suf_cls_param.
     # This ensures LLM/vision backbones and projection heads are excluded from optimization.
-    if getattr(config, "cls_train", False):
+    if config.cls_train and config.frozen:
         cls_exclusive_freeze = nnx.All(
             nnx.Param,
             nnx.Not(nnx_utils.PathRegex(r".*(pre_cls_param|suf_cls_param|act_cls_proj|obs_cls_proj).*")),
@@ -118,7 +118,7 @@ def init_train_state(
         params = nnx_utils.state_map(params, config.freeze_filter, lambda p: p.replace(p.value.astype(jnp.bfloat16)))
 
         # Determine effective trainable filter (respect cls_train logic)
-        if getattr(config, "cls_train", False):
+        if config.cls_train and config.frozen:
             effective_trainable_filter = nnx.All(
                 nnx.Param,
                 nnx_utils.PathRegex(r".*(pre_cls_param|suf_cls_param|act_cls_proj|obs_cls_proj).*"),
@@ -167,7 +167,7 @@ def train_step(
     model.train()
 
     # Derive effective trainable filter locally (don't rely on config field existence)
-    if getattr(config, "cls_train", False):
+    if config.cls_train and config.frozen:
         effective_trainable_filter = nnx.All(
             nnx.Param,
             nnx_utils.PathRegex(r".*(pre_cls_param|suf_cls_param|act_cls_proj|obs_cls_proj).*"),
