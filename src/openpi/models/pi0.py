@@ -62,12 +62,9 @@ def vicreg_loss(z1, z2, lambda_param=25.0, mu_param=25.0, nu_param=1.0, gamma=1.
 
     # L2 normalization for invariance term (cosine-style MSE); keep original
     # tensors for variance/covariance terms to preserve scale regularization.
-    z1_l2 = jnp.linalg.norm(z1, axis=-1, keepdims=True)
-    z2_l2 = jnp.linalg.norm(z2, axis=-1, keepdims=True)
-    z1_normed = z1 / (z1_l2 + eps)
-    z2_normed = z2 / (z2_l2 + eps)
+
     # Use cosine distance: 1 - cosine_similarity, stable across dimensionality.
-    cosine_sim = jnp.sum(z1_normed * z2_normed, axis=-1)
+    cosine_sim = jnp.sum(z1 * z2, axis=-1)
     invariance_loss = 1.0 - cosine_sim  # [batch, num_tokens]
 
     # Additional diagnostic: reshape to (batch*num_tokens, dim) and compute
@@ -551,12 +548,19 @@ class Pi0(_model.BaseModel):
         obs_cls_out = self.obs_cls_proj(prefix_out[:, :2, :]) * self.obs_cls_temp.value
         act_cls_out = self.act_cls_proj(suffix_out[:, -2:, :]) * self.act_cls_temp.value
 
+        eps = 1e-6
+        z1_l2 = jnp.linalg.norm(obs_cls_out, axis=-1, keepdims=True)
+        z2_l2 = jnp.linalg.norm(act_cls_out, axis=-1, keepdims=True)
+        z1_normed = obs_cls_out / (z1_l2 + eps)
+        z2_normed = act_cls_out / (z2_l2 + eps)
+
+
         vicreg = vicreg_loss(
-            obs_cls_out,
-            act_cls_out,
+            z1_normed,
+            z2_normed,
             lambda_param=25*jax.nn.sigmoid(t_step/300-3),
             mu_param=50.0,
-            nu_param=0.5,
+            nu_param=2,
             gamma=gamma,
         )
 
