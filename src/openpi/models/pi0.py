@@ -106,7 +106,7 @@ def vicreg_loss(z1, z2, lambda_param=25.0, mu_param=25.0, nu_param=1.0, gamma=1.
         std_means_z1.append(jnp.mean(std_z1))
         std_means_z2.append(jnp.mean(std_z2))
 
-        var_loss = jnp.mean(jax.nn.relu(gamma - std_z1)) + jnp.mean(jax.nn.relu(gamma - std_z2))
+        var_loss = jnp.mean(jax.nn.relu(20 * (gamma - std_z1))) + jnp.mean(jax.nn.relu(20 * (gamma - std_z2)))
         variance_losses.append(var_loss)
 
         z1_centered = z1_i - jnp.mean(z1_i, axis=0, keepdims=True)
