@@ -653,8 +653,8 @@ class Pi0(_model.BaseModel):
             cosine_sim = jnp.sum(z1_normed * z2_normed, axis=-1)
             should_sample = cosine_sim < 0.5
             jax.debug.print("cosine_sim={a}", a=cosine_sim)
-            jax.debug.print("z1_normed={a}", a=z1_normed)
-            jax.debug.print("z2_normed={a}", a=z2_normed)
+            jax.debug.print("z1_normed={a}", a=z1_normed[:50])
+            jax.debug.print("z2_normed={a}", a=z2_normed[:50])
         else:
             # If old_obs_cls_head is None, always sample
             should_sample = jnp.array(True)
