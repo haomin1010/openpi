@@ -60,29 +60,24 @@ def vicreg_loss(z1, z2, lambda_param=25.0, mu_param=25.0, nu_param=1.0, gamma=1.
     """
     batch_size, num_tokens, dim = z1.shape
 
-    # L2 normalization for invariance term (cosine-style MSE); keep original
-    # tensors for variance/covariance terms to preserve scale regularization.
+    # Use L2 distance for invariance loss
+    invariance_loss = jnp.mean(jnp.square(z1 - z2), axis=-1)  # [batch, num_tokens]
 
-    # Use cosine distance: 1 - cosine_similarity, stable across dimensionality.
-    cosine_sim = jnp.sum(z1 * z2, axis=-1)
-    invariance_loss = 1.0 - cosine_sim  # [batch, num_tokens]
-
-    # Additional diagnostic: reshape to (batch*num_tokens, dim) and compute
-    # full pairwise cosine similarity matrix between all rows of z1 and z2,
-    # then average to a scalar.
+    # Additional diagnostic: compute pairwise L2 distances
     z1_bt = jnp.reshape(z1, (-1, dim))
     z2_bt = jnp.reshape(z2, (-1, dim))
-    z1_bt_l2 = jnp.linalg.norm(z1_bt, axis=-1, keepdims=True)
-    z2_bt_l2 = jnp.linalg.norm(z2_bt, axis=-1, keepdims=True)
-    z1_bt_norm = z1_bt / (z1_bt_l2 + eps)
-    z2_bt_norm = z2_bt / (z2_bt_l2 + eps)
-    # row_cosine: [BT, BT] = 256x256 when B=128, T=2
-    row_cosine = jnp.matmul(z1_bt_norm, z2_bt_norm.T)
-    matrix_row_cosine_mean = jnp.mean(row_cosine)
-    # Diagonal and off-diagonal means to assess alignment vs collapse
-    bt = row_cosine.shape[0]
-    diag_mean = jnp.mean(jnp.diag(row_cosine))
-    offdiag_mean = jnp.sum(row_cosine * (1.0 - jnp.eye(bt))) / (bt * bt - bt)
+    bt = z1_bt.shape[0]
+    
+    # Pairwise L2 distance matrix: ||z1[i] - z2[j]||^2
+    # Expanding: ||a-b||^2 = ||a||^2 + ||b||^2 - 2*a^T*b
+    z1_norm_sq = jnp.sum(z1_bt ** 2, axis=-1, keepdims=True)  # [bt, 1]
+    z2_norm_sq = jnp.sum(z2_bt ** 2, axis=-1, keepdims=True)  # [bt, 1]
+    pairwise_l2_sq = z1_norm_sq + z2_norm_sq.T - 2 * jnp.matmul(z1_bt, z2_bt.T)  # [bt, bt]
+    
+    matrix_l2_mean = jnp.mean(jnp.sqrt(jnp.maximum(pairwise_l2_sq, 0)))  # avoid negative due to numerical error
+    diag_mean = jnp.mean(jnp.sqrt(jnp.maximum(jnp.diag(pairwise_l2_sq), 0)))
+    offdiag_l2 = jnp.sqrt(jnp.maximum(pairwise_l2_sq, 0)) * (1.0 - jnp.eye(bt))
+    offdiag_mean = jnp.sum(offdiag_l2) / (bt * bt - bt)
 
     # jax.debug.print("VICReg dims: B={b}, T={t}, D={d}", b=z1.shape[0], t=z1.shape[1], d=z1.shape[2])
     # jax.debug.print("invariance_loss mean={m}", m=jnp.mean(invariance_loss))
@@ -145,13 +140,13 @@ def vicreg_loss(z1, z2, lambda_param=25.0, mu_param=25.0, nu_param=1.0, gamma=1.
         a=jnp.mean(lambda_param * invariance_loss),
     )
 
-    # Log the added matrix-level cosine similarity diagnostic
+    # Log the matrix-level L2 distance diagnostic
     jax.debug.print(
-        "matrix_row_cosine_mean={a}",
-        a=matrix_row_cosine_mean,
+        "matrix_l2_mean={a}",
+        a=matrix_l2_mean,
     )
     jax.debug.print(
-        "pairwise diag_mean={a}, offdiag_mean={b}",
+        "pairwise L2: diag_mean={a}, offdiag_mean={b}",
         a=diag_mean,
         b=offdiag_mean,
     )
@@ -548,16 +543,10 @@ class Pi0(_model.BaseModel):
         obs_cls_out = self.obs_cls_proj(prefix_out[:, :2, :]) * self.obs_cls_temp.value
         act_cls_out = self.act_cls_proj(suffix_out[:, -2:, :]) * self.act_cls_temp.value
 
-        eps = 1e-6
-        z1_l2 = jnp.linalg.norm(obs_cls_out, axis=-1, keepdims=True)
-        z2_l2 = jnp.linalg.norm(act_cls_out, axis=-1, keepdims=True)
-        z1_normed = obs_cls_out / (z1_l2 + eps)
-        z2_normed = act_cls_out / (z2_l2 + eps)
-
-
+        # 直接使用原始表征，不做归一化
         vicreg = vicreg_loss(
-            z1_normed,
-            z2_normed,
+            obs_cls_out,
+            act_cls_out,
             lambda_param=25*jax.nn.sigmoid(t_step/300-3),
             mu_param=50.0,
             nu_param=2,
@@ -645,16 +634,13 @@ class Pi0(_model.BaseModel):
 
         new_obs_cls_heads = obs_cls_heads[0, 0, :]
         if old_obs_cls_head is not None:
-            z1_l2 = jnp.linalg.norm(new_obs_cls_heads, axis=-1, keepdims=True)
-            z2_l2 = jnp.linalg.norm(old_obs_cls_head, axis=-1, keepdims=True)
-            z1_normed = new_obs_cls_heads / (z1_l2 + 1e-6)
-            z2_normed = old_obs_cls_head / (z2_l2 + 1e-6)
-            # Use cosine distance: 1 - cosine_similarity, stable across dimensionality.
-            cosine_sim = jnp.sum(z1_normed * z2_normed, axis=-1)
-            should_sample = cosine_sim < 0.5
-            jax.debug.print("cosine_sim={a}", a=cosine_sim)
-            jax.debug.print("z1_normed={a}", a=z1_normed[:50])
-            jax.debug.print("z2_normed={a}", a=z2_normed[:50])
+            # Use L2 distance instead of cosine similarity
+            l2_distance = jnp.sqrt(jnp.sum(jnp.square(new_obs_cls_heads - old_obs_cls_head)))
+            # 使用L2距离阈值（需要根据实际表征尺度调整）
+            should_sample = l2_distance > 2.0
+            jax.debug.print("l2_distance={a}", a=l2_distance)
+            jax.debug.print("new_obs_cls_heads sample={a}", a=new_obs_cls_heads[:50])
+            jax.debug.print("old_obs_cls_head sample={a}", a=old_obs_cls_head[:50])
         else:
             # If old_obs_cls_head is None, always sample
             should_sample = jnp.array(True)
