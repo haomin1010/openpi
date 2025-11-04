@@ -647,8 +647,8 @@ class Pi0(_model.BaseModel):
         if old_obs_cls_head is not None:
             z1_l2 = jnp.linalg.norm(new_obs_cls_heads, axis=-1, keepdims=True)
             z2_l2 = jnp.linalg.norm(old_obs_cls_head, axis=-1, keepdims=True)
-            z1_normed = new_obs_cls_heads / (z1_l2 + 1e-4)
-            z2_normed = old_obs_cls_head / (z2_l2 + 1e-4)
+            z1_normed = new_obs_cls_heads / (z1_l2 + 1e-6)
+            z2_normed = old_obs_cls_head / (z2_l2 + 1e-6)
             # Use cosine distance: 1 - cosine_similarity, stable across dimensionality.
             cosine_sim = jnp.sum(z1_normed * z2_normed, axis=-1)
             should_sample = cosine_sim < 0.5
@@ -665,4 +665,5 @@ class Pi0(_model.BaseModel):
             lambda operand: skip(operand),
             (noise, 1.0)
         )
-        return x_0, obs_cls_heads[0, 1, :]
+        #return x_0, obs_cls_heads[0, 1, :]
+        return x_0, old_obs_cls_head
