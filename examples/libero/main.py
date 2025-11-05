@@ -139,6 +139,7 @@ def eval_libero(args: Args) -> None:
                                 )
                             ),
                             "prompt": str(task_description),
+                            "task_id": task_id,
                         }
 
                         # Query model to get action

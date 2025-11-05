@@ -68,6 +68,11 @@ class Policy(BasePolicy):
 
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
+        # 提取 task_id（如果存在）
+        task_id = obs.get("task_id", None)
+        if task_id is not None:
+            logging.info(f"Processing task_id: {task_id}")
+        
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
         inputs = self._input_transform(inputs)
