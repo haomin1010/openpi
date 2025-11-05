@@ -123,6 +123,7 @@ class Policy(BasePolicy):
 
         outputs = self._output_transform(outputs)
         if not have_sample:
+            print("--------")
             outputs["actions"] = None
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
