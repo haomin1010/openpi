@@ -547,10 +547,10 @@ class Pi0(_model.BaseModel):
         vicreg = vicreg_loss(
             obs_cls_out,
             act_cls_out,
-            lambda_param=25*jax.nn.sigmoid(t_step/300-3),
+            lambda_param=50*jax.nn.sigmoid(t_step/300-3),
             mu_param=50.0,
-            nu_param=2,
-            gamma=gamma,
+            nu_param=0.5,
+            gamma=0.5,  # 降低到现实可达的目标，避免与协方差损失冲突
         )
 
         # jax.debug.print("act_cls_heads sample={x}", x=act_cls_out[0, 0, :])
