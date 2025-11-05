@@ -635,12 +635,12 @@ class Pi0(_model.BaseModel):
         new_obs_cls_heads = obs_cls_heads[0, 0, :]
         if old_obs_cls_head is not None:
             # Use L2 distance instead of cosine similarity
-            l2_distance = jnp.sqrt(jnp.sum(jnp.square(new_obs_cls_heads - old_obs_cls_head)))
+            l2_distance = jnp.mean(jnp.square(new_obs_cls_heads - old_obs_cls_head), axis=-1)
             # 使用L2距离阈值（需要根据实际表征尺度调整）
-            should_sample = l2_distance > 2.0
+            should_sample = l2_distance > 0.5
             jax.debug.print("l2_distance={a}", a=l2_distance)
-            jax.debug.print("new_obs_cls_heads sample={a}", a=new_obs_cls_heads[:50])
-            jax.debug.print("old_obs_cls_head sample={a}", a=old_obs_cls_head[:50])
+            #jax.debug.print("new_obs_cls_heads sample={a}", a=new_obs_cls_heads[:50])
+            #jax.debug.print("old_obs_cls_head sample={a}", a=old_obs_cls_head[:50])
         else:
             # If old_obs_cls_head is None, always sample
             should_sample = jnp.array(True)
@@ -651,5 +651,5 @@ class Pi0(_model.BaseModel):
             lambda operand: skip(operand),
             (noise, 1.0)
         )
-        #return x_0, obs_cls_heads[0, 1, :]
-        return x_0, old_obs_cls_head
+        return x_0, obs_cls_heads[0, 1, :]
+        #return x_0, old_obs_cls_head
