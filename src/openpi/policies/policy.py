@@ -102,7 +102,8 @@ class Policy(BasePolicy):
         self.force_sample = not self.force_sample
 
         start_time = time.monotonic()
-        actions, cls_head =  self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs)
+        actions, cls_head, have_sample =  self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs)
+        self.force_sample = not have_sample
         self.old_cls_head = cls_head
         outputs = {
             "state": inputs["state"],

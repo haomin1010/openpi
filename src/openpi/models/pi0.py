@@ -571,7 +571,7 @@ class Pi0(_model.BaseModel):
             noise: at.Float[at.Array, "b ah ad"] | None = None,
             old_obs_cls_head: at.Float[at.Array, "hd"] = None,
             force_sample: bool = False,
-    ) -> (_model.Actions, at.Float[at.Array, "hd"]):
+    ) -> (_model.Actions, at.Float[at.Array, "hd"], bool):
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
@@ -645,6 +645,9 @@ class Pi0(_model.BaseModel):
         else:
             # If old_obs_cls_head is None, always sample
             should_sample = jnp.array(True)
+
+        should_sample = jnp.logical_or(should_sample, force_sample)
+
         x_0, _ = lax.cond(
             should_sample or force_sample,
             lambda operand: jax.lax.while_loop(cond, step, operand),
@@ -652,5 +655,5 @@ class Pi0(_model.BaseModel):
             (noise, 1.0)
         )
         jax.debug.print("x_0={a}", a=x_0)
-        return x_0, obs_cls_heads[0, 1, :]
+        return x_0, obs_cls_heads[0, 1, :], should_sample
         #return x_0, old_obs_cls_head
