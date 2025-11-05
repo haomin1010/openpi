@@ -99,14 +99,11 @@ class Policy(BasePolicy):
 
         sample_kwargs["old_obs_cls_head"] = self.old_cls_head
         sample_kwargs["force_sample"] = self.force_sample
-        self.force_sample = not self.force_sample
 
         start_time = time.monotonic()
         actions, cls_head, have_sample =  self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs)
         self.force_sample = not have_sample
         self.old_cls_head = cls_head
-        if have_sample:
-            actions = None
         outputs = {
             "state": inputs["state"],
             "actions": actions,
@@ -118,6 +115,8 @@ class Policy(BasePolicy):
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
 
         outputs = self._output_transform(outputs)
+        if not have_sample:
+            outputs["actions"] = None
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }

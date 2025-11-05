@@ -92,6 +92,7 @@ def eval_libero(args: Args) -> None:
             # Reset environment
             env.reset()
             action_plan = collections.deque()
+            steps_since_last_request = 0  # 追踪自上次请求以来执行的步数
 
             # Set initial states
             obs = env.set_init_state(initial_states[episode_idx])
@@ -124,8 +125,8 @@ def eval_libero(args: Args) -> None:
                     # Save preprocessed image for replay video
                     replay_images.append(img)
 
-                    if not action_plan:
-                        # Finished executing previous action chunk -- compute new chunk
+                    # 如果动作队列为空，或者已经执行了5个动作，就请求新动作
+                    if not action_plan or steps_since_last_request >= args.replan_steps:
                         # Prepare observations dict
                         element = {
                             "observation/image": img,
@@ -143,12 +144,13 @@ def eval_libero(args: Args) -> None:
                         # Query model to get action
                         action_chunk = client.infer(element)["actions"]
                         if action_chunk is not None:
-                            assert (
-                                len(action_chunk) >= args.replan_steps
-                            ), f"We want to replan every {args.replan_steps} steps, but policy only predicts {len(action_chunk)} steps."
-                            action_plan.extend(action_chunk[: args.replan_steps])
-
+                            # 如果收到新动作，清空旧的未执行动作，用新动作替换
+                            action_plan.clear()
+                            action_plan.extend(action_chunk)  # 保留全部动作
+                            steps_since_last_request = 0  # 重置计数器
+                    
                     action = action_plan.popleft()
+                    steps_since_last_request += 1  # 增加已执行步数计数
 
                     # Execute action in environment
                     obs, reward, done, info = env.step(action.tolist())
