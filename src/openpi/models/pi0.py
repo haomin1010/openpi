@@ -638,7 +638,7 @@ class Pi0(_model.BaseModel):
             # Use L2 distance instead of cosine similarity
             l2_distance = jnp.mean(jnp.square(new_obs_cls_heads - old_obs_cls_head), axis=-1)
             # 使用L2距离阈值（需要根据实际表征尺度调整）
-            should_sample = l2_distance > 0.001
+            should_sample = l2_distance > 0.1
             jax.debug.print("l2_distance={a}", a=l2_distance)
             #jax.debug.print("new_obs_cls_heads sample={a}", a=new_obs_cls_heads[:50])
             #jax.debug.print("old_obs_cls_head sample={a}", a=old_obs_cls_head[:50])
@@ -649,11 +649,11 @@ class Pi0(_model.BaseModel):
         should_sample = jnp.logical_or(should_sample, force_sample)
 
         x_0, _ = lax.cond(
-            should_sample or force_sample,
+            should_sample,
             lambda operand: jax.lax.while_loop(cond, step, operand),
             lambda operand: skip(operand),
             (noise, 1.0)
         )
-        jax.debug.print("x_0={a}", a=x_0)
+        #jax.debug.print("x_0={a}", a=x_0)
         return x_0, obs_cls_heads[0, 1, :], should_sample
         #return x_0, old_obs_cls_head
