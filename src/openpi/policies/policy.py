@@ -56,6 +56,7 @@ class Policy(BasePolicy):
         self._pytorch_device = pytorch_device
         self.old_cls_head = None
         self.force_sample = True
+        self.task_id = -1
 
         if self._is_pytorch_model:
             self._model = self._model.to(pytorch_device)
@@ -72,7 +73,10 @@ class Policy(BasePolicy):
         task_id = obs.get("task_id", None)
         if task_id is not None:
             logging.info(f"Processing task_id: {task_id}")
-        
+        if task_id != self.task_id:
+            self.task_id = task_id
+            self.force_sample = True
+
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
         inputs = self._input_transform(inputs)
