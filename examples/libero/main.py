@@ -74,7 +74,8 @@ def eval_libero(args: Args) -> None:
 
     # Start evaluation
     total_episodes, total_successes = 0, 0
-    for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
+    #for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
+    for task_id in tqdm.tqdm([6,7]):
         # Get task
         task = task_suite.get_task(task_id)
 
@@ -86,6 +87,7 @@ def eval_libero(args: Args) -> None:
 
         # Start episodes
         task_episodes, task_successes = 0, 0
+        all_steps = 0
         for episode_idx in tqdm.tqdm(range(args.num_trials_per_task)):
             logging.info(f"\nTask: {task_description}")
 
@@ -165,7 +167,9 @@ def eval_libero(args: Args) -> None:
                     logging.error(f"Caught exception: {e}")
                     break
 
-            print(f"Total steps: {t}")
+            all_steps += t
+            print(f"epi steps: {t}")
+            print(f"Total steps: {all_steps}")
             task_episodes += 1
             total_episodes += 1
 

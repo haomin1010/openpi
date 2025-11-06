@@ -72,6 +72,9 @@ class Policy(BasePolicy):
         # 提取 task_id（如果存在）
         task_id = obs.get("task_id", None)
         if task_id != self.task_id:
+            print("1111111111111111111")
+            print("1111111111111111111")
+            print("1111111111111111111")
             self.task_id = task_id
             self.force_sample = True
 
