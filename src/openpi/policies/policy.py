@@ -76,7 +76,7 @@ class Policy(BasePolicy):
             print("1111111111111111111")
             print("1111111111111111111")
             self.task_id = task_id
-            self.force_sample = True
+        self.force_sample = obs.get("force_sample", True)
 
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)

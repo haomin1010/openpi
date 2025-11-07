@@ -142,6 +142,7 @@ def eval_libero(args: Args) -> None:
                             ),
                             "prompt": str(task_description),
                             "task_id": task_id*100+episode_idx,
+                            "force_sample": True if not action_plan else False,
                         }
 
                         # Query model to get action
