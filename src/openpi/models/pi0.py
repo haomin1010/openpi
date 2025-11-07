@@ -177,8 +177,7 @@ def vicreg_loss(z1, z2, lambda_param=25.0, mu_param=25.0, nu_param=1.0, gamma=1.
 
     return total_loss
 
-
-def make_attn_mask(input_mask, mask_ar):
+def make_attn_mask(input_mask, mask_ar, action_horizen=50):
     """Adapted from big_vision.
 
     Tokens can attend to valid inputs tokens which have a cumulative mask_ar
@@ -203,9 +202,39 @@ def make_attn_mask(input_mask, mask_ar):
     cumsum = jnp.cumsum(mask_ar, axis=1)
     attn_mask = cumsum[:, None, :] <= cumsum[:, :, None]
 
-    attn_mask = attn_mask.at[:, -2:, :].set(True)
-    attn_mask = attn_mask.at[:, -1, -5:].set(False)
-    attn_mask = attn_mask.at[:, -2, -10:-5].set(False)
+    attn_mask = attn_mask.at[:, -2:, :].set(False)
+    attn_mask = attn_mask.at[:, -2, -action_horizen-2:-5-2].set(True)
+    attn_mask = attn_mask.at[:, -1, -action_horizen+5-2:-2].set(True)
+
+    valid_mask = input_mask[:, None, :] * input_mask[:, :, None]
+
+    return jnp.logical_and(attn_mask, valid_mask)
+
+def make_attn_mask_pre(input_mask, mask_ar):
+    """Adapted from big_vision.
+
+    Tokens can attend to valid inputs tokens which have a cumulative mask_ar
+    smaller or equal to theirs. This way `mask_ar` bool[?B, N] can be used to
+    setup several types of attention, for example:
+
+      [[1 1 1 1 1 1]]: pure causal attention.
+
+      [[0 0 0 1 1 1]]: prefix-lm attention. The first 3 tokens can attend between
+          themselves and the last 3 tokens have a causal attention. The first
+          entry could also be a 1 without changing behaviour.
+
+      [[1 0 1 0 1 0 0 1 0 0]]: causal attention between 4 blocks. Tokens of a
+          block can attend all previous blocks and all tokens on the same block.
+
+    Args:
+      input_mask: bool[B, N] true if its part of the input, false if padding.
+      mask_ar: bool[?B, N] mask that's true where previous tokens cannot depend on
+        it and false where it shares the same attention mask as the previous token.
+    """
+    mask_ar = jnp.broadcast_to(mask_ar, input_mask.shape)
+    cumsum = jnp.cumsum(mask_ar, axis=1)
+    attn_mask = cumsum[:, None, :] <= cumsum[:, :, None]
+
     valid_mask = input_mask[:, None, :] * input_mask[:, :, None]
 
     return jnp.logical_and(attn_mask, valid_mask)
@@ -404,7 +433,7 @@ class Pi0(_model.BaseModel):
         suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)
         input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
         ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
-        attn_mask = make_attn_mask(input_mask, ar_mask)
+        attn_mask = make_attn_mask(input_mask, ar_mask, self.action_horizon)
         positions = jnp.cumsum(input_mask, axis=1) - 1
         (prefix_out, suffix_out), _ = self.PaliGemma.llm(
             [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
@@ -462,7 +491,7 @@ class Pi0(_model.BaseModel):
         prefix_mask = jnp.concatenate(input_mask, axis=1)
         prefix_ar_mask = jnp.array(ar_mask)
 
-        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        prefix_attn_mask = make_attn_mask_pre(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
 
         # PaliGemma output
@@ -513,7 +542,7 @@ class Pi0(_model.BaseModel):
             suffix_mask = jnp.concatenate(suffix_input_mask, axis=1)
             suffix_ar_mask = jnp.array(suffix_ar_mask)
 
-            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask, self.action_horizon)
             prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
             full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
             positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
@@ -582,7 +611,7 @@ class Pi0(_model.BaseModel):
 
         # first fill KV cache with a forward pass of the prefix
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
-        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        prefix_attn_mask = make_attn_mask_pre(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
 
         (prefix_out, _), kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask,
@@ -597,7 +626,7 @@ class Pi0(_model.BaseModel):
             )
             # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to each
             # other
-            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask, self.action_horizon)
             # `prefix_attn_mask` is shape (b, suffix_len, prefix_len) indicating how the suffix tokens can attend to the
             # prefix tokens
             prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
@@ -654,6 +683,6 @@ class Pi0(_model.BaseModel):
             lambda operand: skip(operand),
             (noise, 1.0)
         )
-        #jax.debug.print("x_0={a}", a=x_0)
+        jax.debug.print("x_0.shape={a}", a=x_0.shape)
         return x_0, obs_cls_heads[0, 1, :], should_sample
         #return x_0, old_obs_cls_head
