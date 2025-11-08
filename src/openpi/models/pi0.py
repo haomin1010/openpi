@@ -596,16 +596,20 @@ class Pi0(_model.BaseModel):
             length=num_steps,
         )
 
-        obs_cls_out = jnp.array(
-            [getattr(self.obs_cls_proj, f"head_{i}")(prefix_out[:, :1, :]) for i in range(self.cls_head_count)]
+        obs_cls_out = jnp.stack(
+            [getattr(self.obs_cls_proj, f"head_{i}")(prefix_out[:, :1, :]) for i in range(self.cls_head_count)],
+            axis=1,
         )
+        obs_cls_out = jnp.squeeze(obs_cls_out, axis=2)
         suffix_cls_tokens = suffix_out[:, -self.cls_head_count :, :]
-        act_cls_out = jnp.array(
+        act_cls_out = jnp.stack(
             [
                 getattr(self.act_cls_proj, f"head_{i}")(suffix_cls_tokens[:, i : i + 1, :])
                 for i in range(self.cls_head_count)
-            ]
+            ],
+            axis=1,
         )
+        act_cls_out = jnp.squeeze(act_cls_out, axis=2)
 
         # 直接使用原始表征，不做归一化
         vicreg = vicreg_loss(
