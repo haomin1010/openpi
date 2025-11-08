@@ -299,8 +299,24 @@ class Pi0(_model.BaseModel):
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
 
-        self.obs_cls_proj_list = [MLP(paligemma_config.width, 2 * paligemma_config.width, 256, rngs=rngs) for i in range(5)]
-        self.act_cls_proj_list = [MLP(action_expert_config.width, 2 * paligemma_config.width, 256, rngs=rngs) for i in range(5)]
+        self.cls_head_count = 5
+        cls_head_count = self.cls_head_count
+        self.obs_cls_proj = nnx.Dict(
+            **{
+                f"head_{i}": MLP(
+                    paligemma_config.width, 2 * paligemma_config.width, 256, rngs=rngs
+                )
+                for i in range(cls_head_count)
+            }
+        )
+        self.act_cls_proj = nnx.Dict(
+            **{
+                f"head_{i}": MLP(
+                    action_expert_config.width, 2 * paligemma_config.width, 256, rngs=rngs
+                )
+                for i in range(cls_head_count)
+            }
+        )
 
         # 添加两个可学习的参数（避免把初始化函数作为模块静态字段）
         self.pre_cls_param = nnx.Param(nnx.initializers.normal()(rngs(), (1, 1, paligemma_config.width)))
@@ -572,8 +588,16 @@ class Pi0(_model.BaseModel):
             length=num_steps,
         )
 
-        obs_cls_out = jnp.array([self.obs_cls_proj[i](prefix_out[:, :1, :])  for i in range(5)]) #* self.obs_cls_temp.value
-        act_cls_out = jnp.array([self.act_cls_proj[i](suffix_out[:, -5+i:-4+i, :]) for i in range(5)]) #* self.act_cls_temp.value
+        obs_cls_out = jnp.array(
+            [getattr(self.obs_cls_proj, f"head_{i}")(prefix_out[:, :1, :]) for i in range(self.cls_head_count)]
+        )
+        suffix_cls_tokens = suffix_out[:, -self.cls_head_count :, :]
+        act_cls_out = jnp.array(
+            [
+                getattr(self.act_cls_proj, f"head_{i}")(suffix_cls_tokens[:, i : i + 1, :])
+                for i in range(self.cls_head_count)
+            ]
+        )
 
         # 直接使用原始表征，不做归一化
         vicreg = vicreg_loss(
@@ -622,8 +646,13 @@ class Pi0(_model.BaseModel):
                                                        positions=positions)
 
         now_obs_cls_repr = prefix_out[:, :1, :]
-        old_obs_cls_head = self.obs_cls_proj_list[delta_replan](old_obs_cls_repr)
-        now_obs_cls_head = self.obs_cls_proj_list[0](now_obs_cls_repr)
+        head_idx = min(delta_replan, self.cls_head_count - 1)
+        old_obs_cls_head = (
+            None
+            if old_obs_cls_repr is None
+            else getattr(self.obs_cls_proj, f"head_{head_idx}")(old_obs_cls_repr)
+        )
+        now_obs_cls_head = getattr(self.obs_cls_proj, "head_0")(now_obs_cls_repr)
 
         def step(carry):
             x_t, time = carry
