@@ -320,7 +320,9 @@ class Pi0(_model.BaseModel):
 
         # 添加两个可学习的参数（避免把初始化函数作为模块静态字段）
         self.pre_cls_param = nnx.Param(nnx.initializers.normal()(rngs(), (1, 1, paligemma_config.width)))
-        self.suf_cls_param = nnx.Param(nnx.initializers.normal()(rngs(), (1, 5, action_expert_config.width)))
+        self.suf_cls_param = nnx.Param(
+            nnx.initializers.normal()(rngs(), (1, self.cls_head_count, action_expert_config.width))
+        )
 
         # Learnable temperatures to scale CLS heads before VICReg
         # self.obs_cls_temp = nnx.Param(jnp.array(1.0, dtype=jnp.float32))
@@ -418,8 +420,8 @@ class Pi0(_model.BaseModel):
 
         tokens = jnp.concatenate([tokens, jnp.repeat(self.suf_cls_param.value, repeats=tokens.shape[0], axis=0)],
                                  axis=-2)
-        ar_mask += [True] * 5
-        input_mask.append(jnp.ones((tokens.shape[0], 5), dtype=jnp.bool_))
+        ar_mask += [True] * self.cls_head_count
+        input_mask.append(jnp.ones((tokens.shape[0], self.cls_head_count), dtype=jnp.bool_))
 
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
@@ -457,7 +459,9 @@ class Pi0(_model.BaseModel):
         (prefix_out, suffix_out), _ = self.PaliGemma.llm(
             [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
         )
-        v_t = self.action_out_proj(suffix_out[:, -self.action_horizon - 2:-2])
+        v_t = self.action_out_proj(
+            suffix_out[:, -self.action_horizon - self.cls_head_count : -self.cls_head_count]
+        )
 
         return jnp.mean(jnp.square(v_t - u_t), axis=-1)
 
@@ -555,8 +559,10 @@ class Pi0(_model.BaseModel):
             # suf_cls_param is trainable (not frozen by optimizer filter)
             suf_cls_tokens = jnp.repeat(self.suf_cls_param.value, repeats=suffix_tokens_concat.shape[0], axis=0)
             suffix_tokens = jnp.concatenate([suffix_tokens_concat, suf_cls_tokens], axis=-2)
-            suffix_ar_mask += [True] * 5
-            suffix_input_mask.append(jnp.ones((suffix_tokens_concat.shape[0], 5), dtype=jnp.bool_))
+            suffix_ar_mask += [True] * self.cls_head_count
+            suffix_input_mask.append(
+                jnp.ones((suffix_tokens_concat.shape[0], self.cls_head_count), dtype=jnp.bool_)
+            )
 
             suffix_mask = jnp.concatenate(suffix_input_mask, axis=1)
             suffix_ar_mask = jnp.array(suffix_ar_mask)
@@ -573,12 +579,14 @@ class Pi0(_model.BaseModel):
                 kv_cache=kv_cache,
                 adarms_cond=[None, adarms_cond],
             )
-            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon - 2:-2])
+            v_t = self.action_out_proj(
+                suffix_out[:, -self.action_horizon - self.cls_head_count : -self.cls_head_count]
+            )
 
             return (x_t + dt * v_t, time + dt, suffix_out), None
 
         # Fixed-length unrolled loop via scan to enable reverse-mode autodiff
-        suffix_len = (0 if self.pi05 else 1) + self.action_horizon + 2
+        suffix_len = (0 if self.pi05 else 1) + self.action_horizon + self.cls_head_count
         suffix_width = self.action_out_proj.in_features
         init_suffix_out = jnp.zeros((batch_size, suffix_len, suffix_width), dtype=prefix_out.dtype)
         (x_t_final, time_final, suffix_out), _ = jax.lax.scan(
@@ -684,7 +692,9 @@ class Pi0(_model.BaseModel):
                 adarms_cond=[None, adarms_cond],
             )
             assert prefix_out is None
-            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon - 2:-2])
+            v_t = self.action_out_proj(
+                suffix_out[:, -self.action_horizon - self.cls_head_count : -self.cls_head_count]
+            )
 
             return x_t + dt * v_t, time + dt
 
