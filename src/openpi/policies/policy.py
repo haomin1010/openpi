@@ -56,6 +56,7 @@ class Policy(BasePolicy):
         self._pytorch_device = pytorch_device
         self.old_cls_head = None
         self.force_sample = True
+        self.replan_count = 1
         self.task_id = -1
 
         if self._is_pytorch_model:
@@ -113,7 +114,6 @@ class Policy(BasePolicy):
         start_time = time.monotonic()
         actions, cls_head, have_sample =  self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs)
         self.force_sample = not have_sample
-        self.old_cls_head = cls_head
         outputs = {
             "state": inputs["state"],
             "actions": actions,
@@ -128,6 +128,11 @@ class Policy(BasePolicy):
         if not have_sample:
             print("--------")
             outputs["actions"] = None
+            self.replan_count += 1
+        else:
+            self.old_cls_head = cls_head
+            self.replan_count = 1
+
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }

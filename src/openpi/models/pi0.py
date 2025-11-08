@@ -295,17 +295,16 @@ class Pi0(_model.BaseModel):
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
 
-        self.obs_cls_proj = MLP(paligemma_config.width, 2 * paligemma_config.width, 256, rngs=rngs)
-        self.act_cls_proj = MLP(action_expert_config.width, 2 * paligemma_config.width, 256,
-                                rngs=rngs)
+        self.obs_cls_proj_list = [MLP(paligemma_config.width, 2 * paligemma_config.width, 256, rngs=rngs) for i in range(5)]
+        self.act_cls_proj_list = [MLP(action_expert_config.width, 2 * paligemma_config.width, 256, rngs=rngs) for i in range(5)]
 
         # 添加两个可学习的参数（避免把初始化函数作为模块静态字段）
-        self.pre_cls_param = nnx.Param(nnx.initializers.normal()(rngs(), (1, 2, paligemma_config.width)))
-        self.suf_cls_param = nnx.Param(nnx.initializers.normal()(rngs(), (1, 2, action_expert_config.width)))
+        self.pre_cls_param = nnx.Param(nnx.initializers.normal()(rngs(), (1, 1, paligemma_config.width)))
+        self.suf_cls_param = nnx.Param(nnx.initializers.normal()(rngs(), (1, 5, action_expert_config.width)))
 
         # Learnable temperatures to scale CLS heads before VICReg
-        self.obs_cls_temp = nnx.Param(jnp.array(1.0, dtype=jnp.float32))
-        self.act_cls_temp = nnx.Param(jnp.array(1.0, dtype=jnp.float32))
+        # self.obs_cls_temp = nnx.Param(jnp.array(1.0, dtype=jnp.float32))
+        # self.act_cls_temp = nnx.Param(jnp.array(1.0, dtype=jnp.float32))
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
@@ -343,8 +342,8 @@ class Pi0(_model.BaseModel):
 
         tokens = jnp.concatenate([jnp.repeat(self.pre_cls_param.value, repeats=tokens.shape[0], axis=0), tokens],
                                  axis=-2)
-        ar_mask += [False] * 2
-        input_mask.append(jnp.ones((tokens.shape[0], 2), dtype=jnp.bool_))
+        ar_mask += [False]
+        input_mask.append(jnp.ones((tokens.shape[0], 1), dtype=jnp.bool_))
 
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
@@ -399,8 +398,8 @@ class Pi0(_model.BaseModel):
 
         tokens = jnp.concatenate([tokens, jnp.repeat(self.suf_cls_param.value, repeats=tokens.shape[0], axis=0)],
                                  axis=-2)
-        ar_mask += [True] * 2
-        input_mask.append(jnp.ones((tokens.shape[0], 2), dtype=jnp.bool_))
+        ar_mask += [True] * 5
+        input_mask.append(jnp.ones((tokens.shape[0], 5), dtype=jnp.bool_))
 
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
@@ -486,8 +485,8 @@ class Pi0(_model.BaseModel):
         # pre_cls_param is trainable (not frozen by optimizer filter)
         pre_cls_tokens = jnp.repeat(self.pre_cls_param.value, repeats=tokens.shape[0], axis=0)
         prefix_tokens = jnp.concatenate([pre_cls_tokens, tokens], axis=-2)
-        ar_mask = [False] * 2 + ar_mask
-        input_mask.append(jnp.ones((tokens.shape[0], 2), dtype=jnp.bool_))
+        ar_mask = [False] + ar_mask
+        input_mask.append(jnp.ones((tokens.shape[0], 1), dtype=jnp.bool_))
         prefix_mask = jnp.concatenate(input_mask, axis=1)
         prefix_ar_mask = jnp.array(ar_mask)
 
@@ -536,8 +535,8 @@ class Pi0(_model.BaseModel):
             # suf_cls_param is trainable (not frozen by optimizer filter)
             suf_cls_tokens = jnp.repeat(self.suf_cls_param.value, repeats=suffix_tokens_concat.shape[0], axis=0)
             suffix_tokens = jnp.concatenate([suffix_tokens_concat, suf_cls_tokens], axis=-2)
-            suffix_ar_mask += [True] * 2
-            suffix_input_mask.append(jnp.ones((suffix_tokens_concat.shape[0], 2), dtype=jnp.bool_))
+            suffix_ar_mask += [True] * 5
+            suffix_input_mask.append(jnp.ones((suffix_tokens_concat.shape[0], 5), dtype=jnp.bool_))
 
             suffix_mask = jnp.concatenate(suffix_input_mask, axis=1)
             suffix_ar_mask = jnp.array(suffix_ar_mask)
@@ -569,8 +568,8 @@ class Pi0(_model.BaseModel):
             length=num_steps,
         )
 
-        obs_cls_out = self.obs_cls_proj(prefix_out[:, :2, :]) * self.obs_cls_temp.value
-        act_cls_out = self.act_cls_proj(suffix_out[:, -2:, :]) * self.act_cls_temp.value
+        obs_cls_out = jnp.array([self.obs_cls_proj[i](prefix_out[:, :1, :])  for i in range(5)]) #* self.obs_cls_temp.value
+        act_cls_out = jnp.array([self.act_cls_proj[i](suffix_out[:, -5+i:-4+i, :]) for i in range(5)]) #* self.act_cls_temp.value
 
         # 直接使用原始表征，不做归一化
         vicreg = vicreg_loss(
@@ -598,8 +597,9 @@ class Pi0(_model.BaseModel):
             *,
             num_steps: int | at.Int[at.Array, ""] = 10,
             noise: at.Float[at.Array, "b ah ad"] | None = None,
-            old_obs_cls_head: at.Float[at.Array, "hd"] = None,
+            old_obs_cls_repr: at.Float[at.Array, "hd"] = None,
             force_sample: bool = False,
+            delta_replan: int = 0,
     ) -> (_model.Actions, at.Float[at.Array, "hd"], bool):
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
@@ -617,7 +617,9 @@ class Pi0(_model.BaseModel):
         (prefix_out, _), kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask,
                                                        positions=positions)
 
-        obs_cls_heads = self.obs_cls_proj(prefix_out[:, :2, :])
+        now_obs_cls_repr = prefix_out[:, :1, :]
+        old_obs_cls_head = self.obs_cls_proj_list[delta_replan](old_obs_cls_repr)
+        now_obs_cls_head = self.obs_cls_proj_list[0](now_obs_cls_repr)
 
         def step(carry):
             x_t, time = carry
@@ -662,14 +664,13 @@ class Pi0(_model.BaseModel):
             x_t, time = carry
             return x_t, time
 
-        new_obs_cls_heads = obs_cls_heads[0, 0, :]
         if old_obs_cls_head is not None:
             # Use L2 distance instead of cosine similarity
-            l2_distance = jnp.mean(jnp.square(new_obs_cls_heads - old_obs_cls_head), axis=-1)
+            l2_distance = jnp.mean(jnp.square(now_obs_cls_head - old_obs_cls_head), axis=-1)
             # 使用L2距离阈值（需要根据实际表征尺度调整）
             should_sample = l2_distance > 0.1
             jax.debug.print("l2_distance={a}", a=l2_distance)
-            #jax.debug.print("new_obs_cls_heads sample={a}", a=new_obs_cls_heads[:50])
+            #jax.debug.print("now_obs_cls_heads sample={a}", a=now_obs_cls_heads[:50])
             #jax.debug.print("old_obs_cls_head sample={a}", a=old_obs_cls_head[:50])
         else:
             # If old_obs_cls_head is None, always sample
@@ -684,5 +685,5 @@ class Pi0(_model.BaseModel):
             (noise, 1.0)
         )
         #jax.debug.print("x_0.shape={a}", a=x_0.shape)
-        return x_0, obs_cls_heads[0, 1, :], should_sample
+        return x_0, now_obs_cls_repr, should_sample
         #return x_0, old_obs_cls_head
