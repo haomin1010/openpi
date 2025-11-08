@@ -202,10 +202,14 @@ def make_attn_mask(input_mask, mask_ar, action_horizen=50):
     cumsum = jnp.cumsum(mask_ar, axis=1)
     attn_mask = cumsum[:, None, :] <= cumsum[:, :, None]
 
-    attn_mask = attn_mask.at[:, -2:, :].set(False)
-    attn_mask = attn_mask.at[:, -2, -action_horizen-2:-5-2].set(True)
-    attn_mask = attn_mask.at[:, -1, -action_horizen+5-2:-2].set(True)
-
+    attn_mask = attn_mask.at[:, -5:, :].set(False)
+    begin_idx = -action_horizen-5
+    interval = 10
+    attn_mask = attn_mask.at[:, -5, begin_idx:begin_idx+interval].set(True)
+    attn_mask = attn_mask.at[:, -4, begin_idx+interval:begin_idx+2*interval].set(True)
+    attn_mask = attn_mask.at[:, -3, begin_idx+2*interval:begin_idx+3*interval].set(True)
+    attn_mask = attn_mask.at[:, -2, begin_idx+3*interval:begin_idx+4*interval].set(True)
+    attn_mask = attn_mask.at[:, -1, begin_idx+4*interval:begin_idx+5*interval].set(True)
     valid_mask = input_mask[:, None, :] * input_mask[:, :, None]
 
     return jnp.logical_and(attn_mask, valid_mask)
