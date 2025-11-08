@@ -108,7 +108,7 @@ class Policy(BasePolicy):
 
         sample_kwargs["old_obs_cls_head"] = self.old_cls_head
         sample_kwargs["force_sample"] = self.force_sample
-
+        sample_kwargs["delta_replan"] = self.replan_count
         start_time = time.monotonic()
         actions, cls_head, have_sample =  self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs)
         self.force_sample = not have_sample
