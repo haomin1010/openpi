@@ -152,6 +152,8 @@ def eval_libero(args: Args) -> None:
                             action_plan.clear()
                             action_plan.extend(action_chunk)  # 保留全部动作
                             steps_since_last_request = 0  # 重置计数器
+                        else:
+                            steps_since_last_request = 0
                     
                     action = action_plan.popleft()
                     steps_since_last_request += 1  # 增加已执行步数计数
