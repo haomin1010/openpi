@@ -91,7 +91,7 @@ def init_train_state(
     if config.cls_train and config.frozen:
         cls_exclusive_freeze = nnx.All(
             nnx.Param,
-            nnx.Not(nnx_utils.PathRegex(r".*(pre_cls_param|suf_cls_param|act_cls_proj|obs_cls_proj).*")),
+            nnx.Not(nnx_utils.PathRegex(r".*(cls_proj|cls_param).*")),
         )
         # Freeze everything except the CLS-related params
         config = dataclasses.replace(
@@ -121,7 +121,7 @@ def init_train_state(
         if config.cls_train and config.frozen:
             effective_trainable_filter = nnx.All(
                 nnx.Param,
-                nnx_utils.PathRegex(r".*(pre_cls_param|suf_cls_param|act_cls_proj|obs_cls_proj).*"),
+                nnx_utils.PathRegex(r".*(cls_proj|cls_param).*"),
             )
         else:
             effective_trainable_filter = config.trainable_filter
@@ -170,7 +170,7 @@ def train_step(
     if config.cls_train and config.frozen:
         effective_trainable_filter = nnx.All(
             nnx.Param,
-            nnx_utils.PathRegex(r".*(pre_cls_param|suf_cls_param|act_cls_proj|obs_cls_proj).*"),
+            nnx_utils.PathRegex(r".*(cls_proj|cls_param).*"),
         )
         # Also keep model in train mode but frozen parts won't receive grads by DiffState
     else:
