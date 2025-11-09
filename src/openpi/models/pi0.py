@@ -724,6 +724,8 @@ class Pi0(_model.BaseModel):
             x_t, time = carry
             return x_t, time
 
+        jax.debug.print("now_obs_cls_head={a}", a=now_obs_cls_head)
+        jax.debug.print("now_obs_cls_repr={a}", a=now_obs_cls_repr)
         if old_obs_cls_head is not None:
             # Use L2 distance instead of cosine similarity
             l2_distance = jnp.mean(jnp.square(now_obs_cls_head - old_obs_cls_head), axis=-1)
@@ -745,7 +747,7 @@ class Pi0(_model.BaseModel):
             lambda operand: skip(operand),
             (noise, 1.0)
         )
-        jax.debug.print("x_0={a}", a=x_0[1, :10,:7])
-        jax.debug.print("x_1={a}", a=x_0[1, 10:20, :7])
+        #jax.debug.print("x_0={a}", a=x_0[1, :10,:7])
+        #jax.debug.print("x_1={a}", a=x_0[1, 10:20, :7])
         return x_0, now_obs_cls_repr, should_sample
         #return x_0, old_obs_cls_head
