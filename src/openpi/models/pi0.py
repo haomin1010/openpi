@@ -418,10 +418,10 @@ class Pi0(_model.BaseModel):
         ar_mask += [True] + ([False] * (self.action_horizon - 1))
         tokens = jnp.concatenate(tokens, axis=1)
 
-        tokens = jnp.concatenate([tokens, jnp.repeat(self.suf_cls_param.value, repeats=tokens.shape[0], axis=0)],
-                                 axis=-2)
-        ar_mask += [True] * self.cls_head_count
-        input_mask.append(jnp.ones((tokens.shape[0], self.cls_head_count), dtype=jnp.bool_))
+        #tokens = jnp.concatenate([tokens, jnp.repeat(self.suf_cls_param.value, repeats=tokens.shape[0], axis=0)],
+        #                         axis=-2)
+        #ar_mask += [True] * self.cls_head_count
+        #input_mask.append(jnp.ones((tokens.shape[0], self.cls_head_count), dtype=jnp.bool_))
 
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
@@ -686,7 +686,7 @@ class Pi0(_model.BaseModel):
             )
             # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to each
             # other
-            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask, self.action_horizon)
+            suffix_attn_mask = make_attn_mask_pre(suffix_mask, suffix_ar_mask)
             # `prefix_attn_mask` is shape (b, suffix_len, prefix_len) indicating how the suffix tokens can attend to the
             # prefix tokens
             prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
