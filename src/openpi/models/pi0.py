@@ -710,7 +710,7 @@ class Pi0(_model.BaseModel):
             )
             assert prefix_out is None
             v_t = self.action_out_proj(
-                suffix_out[:, -self.action_horizon - self.cls_head_count : -self.cls_head_count]
+                suffix_out[:, -self.action_horizon  : ]
             )
 
             return x_t + dt * v_t, time + dt
