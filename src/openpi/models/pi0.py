@@ -318,7 +318,7 @@ class Pi0(_model.BaseModel):
         action_cls_head.lazy_init(rngs=rngs, method="init", use_adarms=[False, True] if config.pi05 else [False, False])
         self.action_cls_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
         # 添加一个映射头，用于将actions映射到与noise相同的维度
-        self.action_to_noise_proj = nnx.Linear(config.action_dim, config.action_dim, rngs=rngs)
+        self.action_cls_head_proj = nnx.Linear(config.action_dim, config.action_dim, rngs=rngs)
 
 
         img = nnx_bridge.ToNNX(
@@ -568,7 +568,7 @@ class Pi0(_model.BaseModel):
         suffix_width = self.action_out_proj.in_features
         init_suffix_out = jnp.zeros((batch_size, suffix_len, suffix_width), dtype=prefix_out.dtype)
         # 将actions通过映射头转换为x_t的初始值
-        x_t_init = self.action_to_noise_proj(actions)
+        x_t_init = self.action_cls_head_proj(actions)
         x_t, time, _ = x_t_init, 0.0, init_suffix_out
 
         suffix_input_mask = []
