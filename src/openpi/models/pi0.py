@@ -604,13 +604,14 @@ class Pi0(_model.BaseModel):
         # 使用新的交错掩码函数，每11个token（10个action + 1个cls）形成一组
         suffix_attn_mask = make_attn_mask_interleaved(suffix_mask, group_size=11, num_groups=5)
 
-        positions = jnp.array([i for i in range(11)] * 5)
+        positions = jnp.tile(jnp.arange(11), 5)[None, :]  # shape: (1, 55)
+        positions = jnp.broadcast_to(positions, (batch_size, 55))
 
         suffix_out, _ = self.PaliGemma.act_cls_head(
             [suffix_tokens],
             mask=suffix_attn_mask,
             positions=positions,
-            kv_cache=kv_cache,
+            kv_cache=None,
             adarms_cond=[None],
         )
 
@@ -624,7 +625,7 @@ class Pi0(_model.BaseModel):
 
         act_cls_out = jnp.stack(
             [
-                getattr(self.act_cls_proj, f"head_{i}")(suffix_out[:, i*10: i*10 + 1, :])
+                getattr(self.act_cls_proj, f"head_{i}")(suffix_out[:, i*11+10: i*11+11, :])
                 for i in range(self.cls_head_count)
             ],
             axis=1,
@@ -645,9 +646,8 @@ class Pi0(_model.BaseModel):
         # jax.debug.print("obs_cls_heads sample={x}", x=obs_cls_out[0, 0, :])
         # jax.debug.print("actions sample={x}", x=actions[0, 0, :])
         # jax.debug.print("shape={x}", x=act_cls_out.shape)
-        act_loss = jnp.mean(jnp.mean(jnp.square(x_t_final - actions), axis=-1), axis=-1)
-        jax.debug.print("act_loss={a}", a=jnp.mean(act_loss))
-        return jnp.mean(vicreg, axis=-1) + 100000*act_loss
+
+        return jnp.mean(vicreg, axis=-1)
 
     def _apply_obs_cls_head(
             self,
