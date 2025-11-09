@@ -629,6 +629,19 @@ class Pi0(_model.BaseModel):
         jax.debug.print("act_loss={a}", a=jnp.mean(act_loss))
         return jnp.mean(vicreg, axis=-1) + 100000*act_loss
 
+    def _apply_obs_cls_head(
+            self,
+            head_idx: at.Int[at.Array, ""],
+            representation: at.Float[at.Array, "b 1 emb"],
+    ) -> at.Float[at.Array, "b 1 256"]:
+        """Apply the selected observation CLS head using JAX control flow."""
+        branches = tuple(
+            lambda rep, module=getattr(self.obs_cls_proj, f"head_{i}"): module(rep)
+            for i in range(self.cls_head_count)
+        )
+        head_idx = jnp.asarray(head_idx, dtype=jnp.int32)
+        return lax.switch(head_idx, branches, representation)
+
     @override
     def sample_actions(
             self,
@@ -658,11 +671,11 @@ class Pi0(_model.BaseModel):
                                                        positions=positions)
 
         now_obs_cls_repr = prefix_out[:, :1, :]
-        head_idx = min(delta_replan, self.cls_head_count - 1)
+        head_idx = jnp.minimum(delta_replan, self.cls_head_count - 1)
         old_obs_cls_head = (
             None
             if old_obs_cls_repr is None
-            else getattr(self.obs_cls_proj, f"head_{head_idx}")(old_obs_cls_repr)
+            else self._apply_obs_cls_head(head_idx, old_obs_cls_repr)
         )
         now_obs_cls_head = getattr(self.obs_cls_proj, "head_0")(now_obs_cls_repr)
 
