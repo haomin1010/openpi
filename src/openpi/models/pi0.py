@@ -736,7 +736,8 @@ class Pi0(_model.BaseModel):
             # If old_obs_cls_head is None, always sample
             should_sample = jnp.array(True)
 
-        should_sample = jnp.logical_or(should_sample, force_sample)
+        force_sample_array = jnp.asarray(force_sample, dtype=jnp.bool_)
+        should_sample = jnp.logical_or(jnp.any(should_sample), force_sample_array)
 
         x_0, _ = lax.cond(
             should_sample,

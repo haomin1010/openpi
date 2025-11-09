@@ -104,7 +104,7 @@ class Policy(BasePolicy):
         if self.old_cls_head is None and not self._is_pytorch_model:
             # 安全地获取维度，如果模型没有 suf_cls_param 则跳过初始化
             if hasattr(self._model, 'suf_cls_param') and hasattr(self._model.suf_cls_param, 'value'):
-                self.old_cls_head = jnp.ones(2048, dtype=jnp.float)
+                self.old_cls_head = jnp.ones(2048, dtype=jnp.float32)
         sample_kwargs["old_obs_cls_repr"] = self.old_cls_head
         sample_kwargs["force_sample"] = self.force_sample
         sample_kwargs["delta_replan"] = self.replan_count
