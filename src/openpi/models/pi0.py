@@ -745,6 +745,7 @@ class Pi0(_model.BaseModel):
             lambda operand: skip(operand),
             (noise, 1.0)
         )
-        #jax.debug.print("x_0.shape={a}", a=x_0.shape)
+        jax.debug.print("x_0={a}", a=x_0[1, :10,:])
+        jax.debug.print("x_0={a}", a=x_0[1, 10:20, :])
         return x_0, now_obs_cls_repr, should_sample
         #return x_0, old_obs_cls_head
