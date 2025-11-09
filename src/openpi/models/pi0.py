@@ -315,7 +315,7 @@ class Pi0(_model.BaseModel):
             )
         )
 
-        action_cls_head.lazy_init(rngs=rngs, method="init", use_adarms=[False, True] if config.pi05 else [False, False])
+        action_cls_head.lazy_init(rngs=rngs, method="init", use_adarms=[False])
         self.action_cls_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
         # 添加一个映射头，用于将actions映射到与noise相同的维度
         self.action_cls_head_proj = nnx.Linear(config.action_dim, config.action_dim, rngs=rngs)
@@ -607,7 +607,7 @@ class Pi0(_model.BaseModel):
         positions = jnp.tile(jnp.arange(11), 5)[None, :]  # shape: (1, 55)
         positions = jnp.broadcast_to(positions, (batch_size, 55))
 
-        suffix_out, _ = self.PaliGemma.act_cls_head(
+        (suffix_out,), _ = self.PaliGemma.act_cls_head(
             [suffix_tokens],
             mask=suffix_attn_mask,
             positions=positions,
