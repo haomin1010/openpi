@@ -670,14 +670,14 @@ class Pi0(_model.BaseModel):
         (prefix_out, _), kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask,
                                                        positions=positions)
 
-        now_obs_cls_repr = prefix_out[:, :1, :]
+        now_obs_cls_repr = prefix_out[0, 0]
         head_idx = jnp.minimum(delta_replan, self.cls_head_count - 1)
         old_obs_cls_head = (
             None
             if old_obs_cls_repr is None
             else self._apply_obs_cls_head(head_idx, old_obs_cls_repr)
         )
-        now_obs_cls_head = getattr(self.obs_cls_proj, "head_0")(now_obs_cls_repr)
+        now_obs_cls_head = getattr(self.obs_cls_proj, "head_0")(now_obs_cls_repr)[0,0]
 
         def step(carry):
             x_t, time = carry
@@ -724,13 +724,15 @@ class Pi0(_model.BaseModel):
             x_t, time = carry
             return x_t, time
 
-        jax.debug.print("now_obs_cls_head={a}", a=now_obs_cls_head)
-        jax.debug.print("now_obs_cls_repr={a}", a=now_obs_cls_repr)
+        if old_obs_cls_head is not None:
+            jax.debug.print("old_obs_cls_head={a}", a=old_obs_cls_head[:20])
+            jax.debug.print("now_obs_cls_head={a}", a=now_obs_cls_head[:20])
+            jax.debug.print("now_obs_cls_repr={a}", a=now_obs_cls_repr[:20])
         if old_obs_cls_head is not None:
             # Use L2 distance instead of cosine similarity
             l2_distance = jnp.mean(jnp.square(now_obs_cls_head - old_obs_cls_head), axis=-1)
             # 使用L2距离阈值（需要根据实际表征尺度调整）
-            should_sample = l2_distance > 0.1
+            should_sample = l2_distance > 1.0
             jax.debug.print("l2_distance={a}", a=l2_distance)
             #jax.debug.print("now_obs_cls_heads sample={a}", a=now_obs_cls_heads[:50])
             #jax.debug.print("old_obs_cls_head sample={a}", a=old_obs_cls_head[:50])
