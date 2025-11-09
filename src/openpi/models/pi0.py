@@ -177,6 +177,34 @@ def vicreg_loss(z1, z2, lambda_param=25.0, mu_param=25.0, nu_param=1.0, gamma=1.
 
     return total_loss
 
+def make_attn_mask_interleaved(input_mask, group_size=11, num_groups=5):
+    """Create attention mask for interleaved tokens where each group can only attend to itself.
+    
+    Args:
+      input_mask: bool[B, N] true if its part of the input, false if padding.
+      group_size: int, size of each group (default 11: 10 action tokens + 1 cls token)
+      num_groups: int, number of groups (default 5)
+    
+    Returns:
+      Attention mask where tokens in each group can only attend to tokens in the same group.
+    """
+    batch_size = input_mask.shape[0]
+    seq_len = input_mask.shape[1]
+    
+    # Create group indices for each token
+    # Group 0: [0, 1, ..., 10], Group 1: [11, 12, ..., 21], etc.
+    token_indices = jnp.arange(seq_len)
+    group_indices = token_indices // group_size  # [0,0,0,...,0, 1,1,1,...,1, ...]
+    
+    # Create attention mask: token i can attend to token j if they're in the same group
+    attn_mask = group_indices[None, :, None] == group_indices[None, None, :]  # [1, seq_len, seq_len]
+    attn_mask = jnp.broadcast_to(attn_mask, (batch_size, seq_len, seq_len))
+    
+    # Apply valid mask
+    valid_mask = input_mask[:, None, :] * input_mask[:, :, None]
+    
+    return jnp.logical_and(attn_mask, valid_mask)
+
 def make_attn_mask(input_mask, mask_ar, action_horizen=50):
     """Adapted from big_vision.
 
@@ -278,6 +306,21 @@ class Pi0(_model.BaseModel):
             )
         )
         llm.lazy_init(rngs=rngs, method="init", use_adarms=[False, True] if config.pi05 else [False, False])
+
+        action_cls_head = nnx_bridge.ToNNX(
+            _gemma.Module(
+                configs=[action_expert_config],
+                embed_dtype=config.dtype,
+                adarms=config.pi05,
+            )
+        )
+
+        action_cls_head.lazy_init(rngs=rngs, method="init", use_adarms=[False, True] if config.pi05 else [False, False])
+        self.action_cls_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
+        # 添加一个映射头，用于将actions映射到与noise相同的维度
+        self.action_to_noise_proj = nnx.Linear(config.action_dim, config.action_dim, rngs=rngs)
+
+
         img = nnx_bridge.ToNNX(
             _siglip.Module(
                 num_classes=paligemma_config.width,
@@ -288,7 +331,7 @@ class Pi0(_model.BaseModel):
             )
         )
         img.lazy_init(next(iter(config.fake_obs().images.values())), train=False, rngs=rngs)
-        self.PaliGemma = nnx.Dict(llm=llm, img=img)
+        self.PaliGemma = nnx.Dict(llm=llm, img=img, act_cls_head=action_cls_head)
         self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
         if config.pi05:
             self.time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
@@ -521,90 +564,67 @@ class Pi0(_model.BaseModel):
         (prefix_out, _), kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask,
                                                        positions=positions)
 
-        def body(carry, _):
-            x_t, time, _ = carry
-            # embed_suffix (parameters are frozen via optimizer filter)
-            suffix_input_mask = []
-            suffix_ar_mask = []
-            suffix_tokens = []
-            if not self.pi05:
-                state_token = self.state_proj(observation.state)[:, None, :]
-                suffix_tokens.append(state_token)
-                suffix_input_mask.append(jnp.ones((observation.state.shape[0], 1), dtype=jnp.bool_))
-                suffix_ar_mask += [True]
-
-            action_tokens = self.action_in_proj(x_t)
-            time_emb = posemb_sincos(jnp.broadcast_to(time, batch_size), self.action_in_proj.out_features,
-                                     min_period=4e-3, max_period=4.0)
-            if self.pi05:
-                time_emb = self.time_mlp_in(time_emb)
-                time_emb = nnx.swish(time_emb)
-                time_emb = self.time_mlp_out(time_emb)
-                time_emb = nnx.swish(time_emb)
-                action_expert_tokens = action_tokens
-                adarms_cond = time_emb
-            else:
-                time_tokens = einops.repeat(time_emb, "b emb -> b s emb", s=self.action_horizon)
-                action_time_tokens = jnp.concatenate([action_tokens, time_tokens], axis=-1)
-                action_time_tokens = self.action_time_mlp_in(action_time_tokens)
-                action_time_tokens = nnx.swish(action_time_tokens)
-                action_time_tokens = self.action_time_mlp_out(action_time_tokens)
-                action_expert_tokens = action_time_tokens
-                adarms_cond = None
-            suffix_tokens.append(action_expert_tokens)
-            suffix_input_mask.append(jnp.ones(action_expert_tokens.shape[:2], dtype=jnp.bool_))
-            suffix_ar_mask += [True] + ([False] * (self.action_horizon - 1))
-            suffix_tokens_concat = jnp.concatenate(suffix_tokens, axis=1)
-
-            # suf_cls_param is trainable (not frozen by optimizer filter)
-            suf_cls_tokens = jnp.repeat(self.suf_cls_param.value, repeats=suffix_tokens_concat.shape[0], axis=0)
-            suffix_tokens = jnp.concatenate([suffix_tokens_concat, suf_cls_tokens], axis=-2)
-            suffix_ar_mask += [True] * self.cls_head_count
-            suffix_input_mask.append(
-                jnp.ones((suffix_tokens_concat.shape[0], self.cls_head_count), dtype=jnp.bool_)
-            )
-
-            suffix_mask = jnp.concatenate(suffix_input_mask, axis=1)
-            suffix_ar_mask = jnp.array(suffix_ar_mask)
-
-            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask, self.action_horizon)
-            prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
-            full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
-            positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
-
-            (prefix_out, suffix_out), _ = self.PaliGemma.llm(
-                [None, suffix_tokens],
-                mask=full_attn_mask,
-                positions=positions,
-                kv_cache=kv_cache,
-                adarms_cond=[None, adarms_cond],
-            )
-            v_t = self.action_out_proj(
-                suffix_out[:, -self.action_horizon - self.cls_head_count : -self.cls_head_count]
-            )
-
-            return (x_t + dt * v_t, time + dt, suffix_out), None
-
-        # Fixed-length unrolled loop via scan to enable reverse-mode autodiff
         suffix_len = (0 if self.pi05 else 1) + self.action_horizon + self.cls_head_count
         suffix_width = self.action_out_proj.in_features
         init_suffix_out = jnp.zeros((batch_size, suffix_len, suffix_width), dtype=prefix_out.dtype)
-        (x_t_final, time_final, suffix_out), _ = jax.lax.scan(
-            body,
-            (noise, 1.0, init_suffix_out),
-            xs=None,
-            length=num_steps,
+        # 将actions通过映射头转换为x_t的初始值
+        x_t_init = self.action_to_noise_proj(actions)
+        x_t, time, _ = x_t_init, 0.0, init_suffix_out
+
+        suffix_input_mask = []
+        suffix_ar_mask = []
+        suffix_tokens = []
+        action_tokens = self.action_cls_in_proj(x_t)
+
+        action_expert_tokens = action_tokens
+
+        suffix_tokens.append(action_expert_tokens)
+        suffix_tokens_concat = jnp.concatenate(suffix_tokens, axis=1)
+        suf_cls_tokens = jnp.repeat(self.suf_cls_param.value, repeats=suffix_tokens_concat.shape[0], axis=0)
+
+        # 将 suf_cls_tokens 的每个头插入到对应位置
+        # suf_cls_tokens shape: (batch, 5, width)
+        # suffix_tokens_concat shape: (batch, 50, width)
+        tokens_parts = []
+        for i in range(self.cls_head_count):
+            start_idx = i * 10
+            end_idx = (i + 1) * 10
+            # 添加这一段的 action tokens (10个)
+            tokens_parts.append(suffix_tokens_concat[:, start_idx:end_idx, :])
+            # 添加对应的 cls token (1个)
+            tokens_parts.append(suf_cls_tokens[:, i:i+1, :])
+
+        suffix_tokens = jnp.concatenate(tokens_parts, axis=1)
+
+        
+        suffix_input_mask.append(jnp.ones(suffix_tokens.shape[:2], dtype=jnp.bool_))
+
+        suffix_mask = jnp.concatenate(suffix_input_mask, axis=1)
+
+        # 使用新的交错掩码函数，每11个token（10个action + 1个cls）形成一组
+        suffix_attn_mask = make_attn_mask_interleaved(suffix_mask, group_size=11, num_groups=5)
+
+        positions = jnp.array([i for i in range(11)] * 5)
+
+        suffix_out, _ = self.PaliGemma.act_cls_head(
+            [suffix_tokens],
+            mask=suffix_attn_mask,
+            positions=positions,
+            kv_cache=kv_cache,
+            adarms_cond=[None],
         )
+
+
 
         obs_cls_out = jnp.stack(
             [getattr(self.obs_cls_proj, f"head_{i}")(prefix_out[:, :1, :]) for i in range(self.cls_head_count)],
             axis=1,
         )
         obs_cls_out = jnp.squeeze(obs_cls_out, axis=2)
-        suffix_cls_tokens = suffix_out[:, -self.cls_head_count :, :]
+
         act_cls_out = jnp.stack(
             [
-                getattr(self.act_cls_proj, f"head_{i}")(suffix_cls_tokens[:, i : i + 1, :])
+                getattr(self.act_cls_proj, f"head_{i}")(suffix_out[:, i*10: i*10 + 1, :])
                 for i in range(self.cls_head_count)
             ],
             axis=1,
@@ -677,7 +697,7 @@ class Pi0(_model.BaseModel):
             if old_obs_cls_repr is None
             else self._apply_obs_cls_head(head_idx, old_obs_cls_repr)
         )
-        now_obs_cls_head = getattr(self.obs_cls_proj, "head_0")(now_obs_cls_repr)[0,0]
+        now_obs_cls_head = getattr(self.obs_cls_proj, "head_0")(now_obs_cls_repr)
 
         def step(carry):
             x_t, time = carry
@@ -732,7 +752,7 @@ class Pi0(_model.BaseModel):
             # Use L2 distance instead of cosine similarity
             l2_distance = jnp.mean(jnp.square(now_obs_cls_head - old_obs_cls_head), axis=-1)
             # 使用L2距离阈值（需要根据实际表征尺度调整）
-            should_sample = l2_distance > 1.0
+            should_sample = l2_distance > 0.1
             jax.debug.print("l2_distance={a}", a=l2_distance)
             #jax.debug.print("now_obs_cls_heads sample={a}", a=now_obs_cls_heads[:50])
             #jax.debug.print("old_obs_cls_head sample={a}", a=old_obs_cls_head[:50])
