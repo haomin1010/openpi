@@ -16,28 +16,27 @@ from jax import lax
 
 logger = logging.getLogger("openpi")
 
-
 class MLP(nnx.Module):
     def __init__(self, in_dim, hidden_dim, out_dim, *, rngs):
         self.fc1 = nnx.Linear(in_dim, hidden_dim, rngs=rngs)
         self.fc2 = nnx.Linear(hidden_dim, hidden_dim, rngs=rngs)
         self.fc3 = nnx.Linear(hidden_dim, hidden_dim, rngs=rngs)
-        self.fc4 = nnx.Linear(hidden_dim, hidden_dim, rngs=rngs)
-        self.fc5 = nnx.Linear(hidden_dim, hidden_dim, rngs=rngs)
+        # self.fc4 = nnx.Linear(hidden_dim, hidden_dim, rngs=rngs)
+        # self.fc5 = nnx.Linear(hidden_dim, hidden_dim, rngs=rngs)
         self.fc6 = nnx.Linear(hidden_dim, out_dim, rngs=rngs)
 
         self.activation_1 = nnx.swish
         self.activation_2 = nnx.swish
         self.activation_3 = nnx.swish
-        self.activation_4 = nnx.swish
-        self.activation_5 = nnx.swish
+        # self.activation_4 = nnx.swish
+        # self.activation_5 = nnx.swish
 
     def __call__(self, x):
         x = self.activation_1(self.fc1(x))
         x = self.activation_2(self.fc2(x))
         x = self.activation_3(self.fc3(x))
-        x = self.activation_4(self.fc4(x))
-        x = self.activation_5(self.fc5(x))
+        # x = self.activation_4(self.fc4(x))
+        # x = self.activation_5(self.fc5(x))
         x = self.fc6(x)
 
         return x
@@ -56,24 +55,24 @@ def vicreg_loss(z1, z2, lambda_param=25.0, mu_param=25.0, nu_param=1.0, gamma=1.
         eps: Small constant for numerical stability
 
     Returns:
-        VICReg loss value [batch, num_tokens]
+        VICReg loss value [batch*num_tokens]
     """
     batch_size, num_tokens, dim = z1.shape
 
-    # Use L2 distance for invariance loss
-    invariance_loss = jnp.mean(jnp.square(z1 - z2), axis=-1)  # [batch, num_tokens]
-
-    # Additional diagnostic: compute pairwise L2 distances
     z1_bt = jnp.reshape(z1, (-1, dim))
     z2_bt = jnp.reshape(z2, (-1, dim))
     bt = z1_bt.shape[0]
-    
+
+    # Use L2 distance for invariance loss
+    invariance_loss = jnp.mean(jnp.square(z1_bt - z2_bt), axis=-1)  # [batch*num_tokens]
+
+
     # Pairwise L2 distance matrix: ||z1[i] - z2[j]||^2
     # Expanding: ||a-b||^2 = ||a||^2 + ||b||^2 - 2*a^T*b
     z1_norm_sq = jnp.sum(z1_bt ** 2, axis=-1, keepdims=True)  # [bt, 1]
     z2_norm_sq = jnp.sum(z2_bt ** 2, axis=-1, keepdims=True)  # [bt, 1]
     pairwise_l2_sq = z1_norm_sq + z2_norm_sq.T - 2 * jnp.matmul(z1_bt, z2_bt.T)  # [bt, bt]
-    
+
     matrix_l2_mean = jnp.mean(jnp.sqrt(jnp.maximum(pairwise_l2_sq, 0)))  # avoid negative due to numerical error
     diag_mean = jnp.mean(jnp.sqrt(jnp.maximum(jnp.diag(pairwise_l2_sq), 0)))
     offdiag_l2 = jnp.sqrt(jnp.maximum(pairwise_l2_sq, 0)) * (1.0 - jnp.eye(bt))
@@ -82,59 +81,40 @@ def vicreg_loss(z1, z2, lambda_param=25.0, mu_param=25.0, nu_param=1.0, gamma=1.
     # jax.debug.print("VICReg dims: B={b}, T={t}, D={d}", b=z1.shape[0], t=z1.shape[1], d=z1.shape[2])
     # jax.debug.print("invariance_loss mean={m}", m=jnp.mean(invariance_loss))
 
-    variance_losses = []
-    covariance_losses = []
-    # Diagnostics collections
-    std_means_z1 = []
-    std_means_z2 = []
-    cov_offdiag_ratio_z1 = []
-    cov_offdiag_ratio_z2 = []
-    cov_loss_z1_list = []
-    cov_loss_z2_list = []
+    # Reshape to (batch*num_tokens, dim) for global variance/covariance computation
+    z1_flat = jnp.reshape(z1, (-1, dim))  # [batch*num_tokens, dim]
+    z2_flat = jnp.reshape(z2, (-1, dim))  # [batch*num_tokens, dim]
+    n_samples = z1_flat.shape[0]  # batch * num_tokens
 
-    for i in range(num_tokens):
-        z1_i = z1[:, i, :]
-        z2_i = z2[:, i, :]
+    # Compute variance across all batch and tokens
+    std_z1 = jnp.sqrt(jnp.var(z1_flat, axis=0) + eps)  # [dim]
+    std_z2 = jnp.sqrt(jnp.var(z2_flat, axis=0) + eps)  # [dim]
 
-        std_z1 = jnp.sqrt(jnp.var(z1_i, axis=0) + eps)
-        std_z2 = jnp.sqrt(jnp.var(z2_i, axis=0) + eps)
-        std_means_z1.append(jnp.mean(std_z1))
-        std_means_z2.append(jnp.mean(std_z2))
+    variance_loss = jnp.mean(jax.nn.relu(gamma - std_z1)) + jnp.mean(jax.nn.relu(gamma - std_z2))
 
-        var_loss = jnp.mean(jax.nn.relu(gamma - std_z1)) + jnp.mean(jax.nn.relu(gamma - std_z2))
-        variance_losses.append(var_loss)
+    # Compute covariance across all batch and tokens
+    z1_centered = z1_flat - jnp.mean(z1_flat, axis=0, keepdims=True)  # [batch*num_tokens, dim]
+    z2_centered = z2_flat - jnp.mean(z2_flat, axis=0, keepdims=True)  # [batch*num_tokens, dim]
 
-        z1_centered = z1_i - jnp.mean(z1_i, axis=0, keepdims=True)
-        z2_centered = z2_i - jnp.mean(z2_i, axis=0, keepdims=True)
+    cov_z1 = (z1_centered.T @ z1_centered) / (n_samples - 1)  # [dim, dim]
+    cov_z2 = (z2_centered.T @ z2_centered) / (n_samples - 1)  # [dim, dim]
 
-        cov_z1 = (z1_centered.T @ z1_centered) / (batch_size - 1)
-        cov_z2 = (z2_centered.T @ z2_centered) / (batch_size - 1)
+    off_diagonal_mask = 1 - jnp.eye(dim)
+    offdiag_z1 = cov_z1 * off_diagonal_mask
+    offdiag_z2 = cov_z2 * off_diagonal_mask
 
-        off_diagonal_mask = 1 - jnp.eye(dim)
-        offdiag_z1 = cov_z1 * off_diagonal_mask
-        offdiag_z2 = cov_z2 * off_diagonal_mask
-        # Separate covariance contributions for diagnostics
-        cov_loss_z1 = jnp.sum(jnp.square(offdiag_z1)) / dim
-        cov_loss_z2 = jnp.sum(jnp.square(offdiag_z2)) / dim
-        cov_loss = cov_loss_z1 + cov_loss_z2
-        cov_loss_z1_list.append(cov_loss_z1)
-        cov_loss_z2_list.append(cov_loss_z2)
+    # Covariance loss
+    cov_loss_z1 = jnp.sum(jnp.square(offdiag_z1)) / dim
+    cov_loss_z2 = jnp.sum(jnp.square(offdiag_z2)) / dim
+    covariance_loss = cov_loss_z1 + cov_loss_z2
 
-        # Off-diagonal ratio diagnostics
-        fro_z1 = jnp.linalg.norm(cov_z1)
-        fro_z2 = jnp.linalg.norm(cov_z2)
-        ratio_z1 = jnp.linalg.norm(offdiag_z1) / (fro_z1 + eps)
-        ratio_z2 = jnp.linalg.norm(offdiag_z2) / (fro_z2 + eps)
-        cov_offdiag_ratio_z1.append(ratio_z1)
-        cov_offdiag_ratio_z2.append(ratio_z2)
-        covariance_losses.append(cov_loss)
+    # Off-diagonal ratio diagnostics
+    fro_z1 = jnp.linalg.norm(cov_z1)
+    fro_z2 = jnp.linalg.norm(cov_z2)
+    ratio_z1 = jnp.linalg.norm(offdiag_z1) / (fro_z1 + eps)
+    ratio_z2 = jnp.linalg.norm(offdiag_z2) / (fro_z2 + eps)
 
-    variance_loss = jnp.stack(variance_losses)
-    # jax.debug.print("variance_loss per-token mean={m}", m=jnp.mean(variance_loss))
-    covariance_loss = jnp.stack(covariance_losses)
-    # jax.debug.print("covariance_loss per-token mean={m}", m=jnp.mean(covariance_loss))
-
-    # Summarize diagnostics across tokens
+    # Summarize diagnostics
     jax.debug.print(
         "invariance_loss z1={a}",
         a=jnp.mean(lambda_param * invariance_loss),
@@ -153,59 +133,60 @@ def vicreg_loss(z1, z2, lambda_param=25.0, mu_param=25.0, nu_param=1.0, gamma=1.
 
     jax.debug.print(
         "std_mean z1={a}, z2={b}, variance_loss={c}",
-        a=jnp.mean(jnp.stack(std_means_z1)),
-        b=jnp.mean(jnp.stack(std_means_z2)),
-        c=jnp.mean(mu_param * variance_loss)
+        a=jnp.mean(std_z1),
+        b=jnp.mean(std_z2),
+        c=mu_param * variance_loss
     )
-    # jax.debug.print(
-    #     "cov_offdiag_ratio z1={a}, z2={b}, total={c}",
-    #     a=jnp.mean(jnp.stack(cov_offdiag_ratio_z1)),
-    #     b=jnp.mean(jnp.stack(cov_offdiag_ratio_z2)),
-    #     c=jnp.mean(mu_param * variance_loss)
-    # )
+    jax.debug.print(
+        "cov_offdiag_ratio z1={a}, z2={b}",
+        a=ratio_z1,
+        b=ratio_z2,
+    )
     jax.debug.print(
         "cov_loss split mean: z1={a}, z2={b}, covariance_loss={c}",
-        a=jnp.mean(jnp.stack(cov_loss_z1_list)),
-        b=jnp.mean(jnp.stack(cov_loss_z2_list)),
-        c=jnp.mean(nu_param * covariance_loss)
+        a=cov_loss_z1,
+        b=cov_loss_z2,
+        c=nu_param * covariance_loss
     )
+
     total_loss = (
             lambda_param * invariance_loss +
-            mu_param * variance_loss[None, :] +
-            nu_param * covariance_loss[None, :]
+            mu_param * variance_loss +
+            nu_param * covariance_loss
     )
 
     return total_loss
 
+
 def make_attn_mask_interleaved(input_mask, group_size=11, num_groups=5):
     """Create attention mask for interleaved tokens where each group can only attend to itself.
-    
+
     Args:
       input_mask: bool[B, N] true if its part of the input, false if padding.
       group_size: int, size of each group (default 11: 10 action tokens + 1 cls token)
       num_groups: int, number of groups (default 5)
-    
+
     Returns:
       Attention mask where tokens in each group can only attend to tokens in the same group.
     """
     batch_size = input_mask.shape[0]
     seq_len = input_mask.shape[1]
-    
+
     # Create group indices for each token
     # Group 0: [0, 1, ..., 10], Group 1: [11, 12, ..., 21], etc.
     token_indices = jnp.arange(seq_len)
     group_indices = token_indices // group_size  # [0,0,0,...,0, 1,1,1,...,1, ...]
-    
+
     # Create attention mask: token i can attend to token j if they're in the same group
     attn_mask = group_indices[None, :, None] == group_indices[None, None, :]  # [1, seq_len, seq_len]
     attn_mask = jnp.broadcast_to(attn_mask, (batch_size, seq_len, seq_len))
-    
+
     # Apply valid mask
     valid_mask = input_mask[:, None, :] * input_mask[:, :, None]
-    
+
     return jnp.logical_and(attn_mask, valid_mask)
 
-def make_attn_mask(input_mask, mask_ar, action_horizen=50):
+def make_attn_mask(input_mask, mask_ar):
     """Adapted from big_vision.
 
     Tokens can attend to valid inputs tokens which have a cumulative mask_ar
@@ -229,52 +210,13 @@ def make_attn_mask(input_mask, mask_ar, action_horizen=50):
     mask_ar = jnp.broadcast_to(mask_ar, input_mask.shape)
     cumsum = jnp.cumsum(mask_ar, axis=1)
     attn_mask = cumsum[:, None, :] <= cumsum[:, :, None]
-
-    attn_mask = attn_mask.at[:, -5:, :].set(False)
-    begin_idx = -action_horizen-5
-    interval = 10
-    attn_mask = attn_mask.at[:, -5, begin_idx:begin_idx+interval].set(True)
-    attn_mask = attn_mask.at[:, -4, begin_idx+interval:begin_idx+2*interval].set(True)
-    attn_mask = attn_mask.at[:, -3, begin_idx+2*interval:begin_idx+3*interval].set(True)
-    attn_mask = attn_mask.at[:, -2, begin_idx+3*interval:begin_idx+4*interval].set(True)
-    attn_mask = attn_mask.at[:, -1, begin_idx+4*interval:begin_idx+5*interval].set(True)
     valid_mask = input_mask[:, None, :] * input_mask[:, :, None]
-
-    return jnp.logical_and(attn_mask, valid_mask)
-
-def make_attn_mask_pre(input_mask, mask_ar):
-    """Adapted from big_vision.
-
-    Tokens can attend to valid inputs tokens which have a cumulative mask_ar
-    smaller or equal to theirs. This way `mask_ar` bool[?B, N] can be used to
-    setup several types of attention, for example:
-
-      [[1 1 1 1 1 1]]: pure causal attention.
-
-      [[0 0 0 1 1 1]]: prefix-lm attention. The first 3 tokens can attend between
-          themselves and the last 3 tokens have a causal attention. The first
-          entry could also be a 1 without changing behaviour.
-
-      [[1 0 1 0 1 0 0 1 0 0]]: causal attention between 4 blocks. Tokens of a
-          block can attend all previous blocks and all tokens on the same block.
-
-    Args:
-      input_mask: bool[B, N] true if its part of the input, false if padding.
-      mask_ar: bool[?B, N] mask that's true where previous tokens cannot depend on
-        it and false where it shares the same attention mask as the previous token.
-    """
-    mask_ar = jnp.broadcast_to(mask_ar, input_mask.shape)
-    cumsum = jnp.cumsum(mask_ar, axis=1)
-    attn_mask = cumsum[:, None, :] <= cumsum[:, :, None]
-
-    valid_mask = input_mask[:, None, :] * input_mask[:, :, None]
-
     return jnp.logical_and(attn_mask, valid_mask)
 
 
 @at.typecheck
 def posemb_sincos(
-        pos: at.Real[at.Array, " b"], embedding_dim: int, min_period: float, max_period: float
+    pos: at.Real[at.Array, " b"], embedding_dim: int, min_period: float, max_period: float
 ) -> at.Float[at.Array, "b {embedding_dim}"]:
     """Computes sine-cosine positional embedding vectors for scalar positions."""
     if embedding_dim % 2 != 0:
@@ -318,7 +260,6 @@ class Pi0(_model.BaseModel):
         action_cls_head.lazy_init(rngs=rngs, method="init", use_adarms=[False])
         self.action_cls_head_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
 
-
         img = nnx_bridge.ToNNX(
             _siglip.Module(
                 num_classes=paligemma_config.width,
@@ -340,6 +281,7 @@ class Pi0(_model.BaseModel):
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
 
+
         self.cls_head_count = 5
         cls_head_count = self.cls_head_count
         self.obs_cls_proj = nnx.Dict(
@@ -350,31 +292,21 @@ class Pi0(_model.BaseModel):
                 for i in range(cls_head_count)
             }
         )
-        self.act_cls_proj = nnx.Dict(
-            **{
-                f"head_{i}": MLP(
+        self.act_cls_proj = nnx.Dict(head_0=MLP(
                     action_expert_config.width, 2 * paligemma_config.width, 256, rngs=rngs
                 )
-                for i in range(cls_head_count)
-            }
         )
 
         # 添加两个可学习的参数（避免把初始化函数作为模块静态字段）
         self.pre_cls_param = nnx.Param(nnx.initializers.normal()(rngs(), (1, 1, paligemma_config.width)))
-        self.suf_cls_param = nnx.Param(
-            nnx.initializers.normal()(rngs(), (1, 1, action_expert_config.width))
-        )
-
-        # Learnable temperatures to scale CLS heads before VICReg
-        # self.obs_cls_temp = nnx.Param(jnp.array(1.0, dtype=jnp.float32))
-        # self.act_cls_temp = nnx.Param(jnp.array(1.0, dtype=jnp.float32))
+        self.suf_cls_param = nnx.Param(nnx.initializers.normal()(rngs(), (1, 1, action_expert_config.width)))
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
 
     @at.typecheck
     def embed_prefix(
-            self, obs: _model.Observation
+        self, obs: _model.Observation, with_cls: bool = False
     ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"]]:
         input_mask = []
         ar_mask = []
@@ -403,19 +335,18 @@ class Pi0(_model.BaseModel):
             ar_mask += [False] * tokenized_inputs.shape[1]
         tokens = jnp.concatenate(tokens, axis=1)
 
-        tokens = jnp.concatenate([jnp.repeat(self.pre_cls_param.value, repeats=tokens.shape[0], axis=0), tokens],
-                                 axis=-2)
-        ar_mask += [False]
-        input_mask.append(jnp.ones((tokens.shape[0], 1), dtype=jnp.bool_))
+        if with_cls:
+            tokens = jnp.concatenate([tokens, jnp.repeat(self.pre_cls_param.value, repeats=tokens.shape[0], axis=0)],axis=-2)
+            ar_mask += [True]
+            input_mask.append(jnp.ones((tokens.shape[0], 1), dtype=jnp.bool_))
 
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
-
         return tokens, input_mask, ar_mask
 
     @at.typecheck
     def embed_suffix(
-            self, obs: _model.Observation, noisy_actions: _model.Actions, timestep: at.Float[at.Array, " b"]
+        self, obs: _model.Observation, noisy_actions: _model.Actions, timestep: at.Float[at.Array, " b"]
     ) -> tuple[
         at.Float[at.Array, "b s emb"],
         at.Bool[at.Array, "b s"],
@@ -458,16 +389,8 @@ class Pi0(_model.BaseModel):
         # image/language/state inputs do not attend to action tokens
         ar_mask += [True] + ([False] * (self.action_horizon - 1))
         tokens = jnp.concatenate(tokens, axis=1)
-
-        # cls_param_list = jnp.repeat(self.suf_cls_param.value, repeats=5, axis=1)
-        # tokens = jnp.concatenate([tokens, jnp.repeat(cls_param_list, repeats=tokens.shape[0], axis=0)],
-        #                         axis=-2)
-        #ar_mask += [True] * self.cls_head_count
-        #input_mask.append(jnp.ones((tokens.shape[0], self.cls_head_count), dtype=jnp.bool_))
-
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
-
         return tokens, input_mask, ar_mask, adarms_cond
 
     @override
@@ -485,7 +408,6 @@ class Pi0(_model.BaseModel):
 
         batch_shape = actions.shape[:-2]
         noise = jax.random.normal(noise_rng, actions.shape)
-
         time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
         time_expanded = time[..., None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
@@ -496,14 +418,12 @@ class Pi0(_model.BaseModel):
         suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)
         input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
         ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
-        attn_mask = make_attn_mask_pre(input_mask, ar_mask, self.action_horizon)
+        attn_mask = make_attn_mask(input_mask, ar_mask)
         positions = jnp.cumsum(input_mask, axis=1) - 1
         (prefix_out, suffix_out), _ = self.PaliGemma.llm(
             [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
         )
-        v_t = self.action_out_proj(
-            suffix_out[:, -self.action_horizon - self.cls_head_count : -self.cls_head_count]
-        )
+        v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
         return jnp.mean(jnp.square(v_t - u_t), axis=-1)
 
@@ -516,12 +436,8 @@ class Pi0(_model.BaseModel):
         Parameter freezing is handled at the optimizer level via freeze_filter,
         so stop_gradient is not needed here.
         """
-        num_steps = 10
         observation = _model.preprocess_observation(None, observation, train=False)
-        dt = -1.0 / num_steps
         batch_size = observation.state.shape[0]
-
-        noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
 
         # Embed prefix (parameters are frozen via optimizer filter)
         input_mask = []
@@ -550,31 +466,24 @@ class Pi0(_model.BaseModel):
 
         # pre_cls_param is trainable (not frozen by optimizer filter)
         pre_cls_tokens = jnp.repeat(self.pre_cls_param.value, repeats=tokens.shape[0], axis=0)
-        prefix_tokens = jnp.concatenate([pre_cls_tokens, tokens], axis=-2)
-        ar_mask = [False] + ar_mask
+        prefix_tokens = jnp.concatenate([tokens, pre_cls_tokens], axis=-2)
+        ar_mask = ar_mask + [True]
         input_mask.append(jnp.ones((tokens.shape[0], 1), dtype=jnp.bool_))
         prefix_mask = jnp.concatenate(input_mask, axis=1)
         prefix_ar_mask = jnp.array(ar_mask)
 
-        prefix_attn_mask = make_attn_mask_pre(prefix_mask, prefix_ar_mask)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
 
         # PaliGemma output
         (prefix_out, _), kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask,
                                                        positions=positions)
 
-        suffix_len = (0 if self.pi05 else 1) + self.action_horizon + self.cls_head_count
-        suffix_width = self.action_out_proj.in_features
-        init_suffix_out = jnp.zeros((batch_size, suffix_len, suffix_width), dtype=prefix_out.dtype)
-        # 将actions通过映射头转换为x_t的初始值
-        x_t, time, _ = actions, 0.0, init_suffix_out
+        x_t= actions
 
         suffix_input_mask = []
-        suffix_ar_mask = []
         suffix_tokens = []
-        action_tokens = self.action_cls_head_proj(x_t)
-
-        action_expert_tokens = action_tokens
+        action_expert_tokens = self.action_cls_head_proj(x_t)
 
         suffix_tokens.append(action_expert_tokens)
         suffix_tokens_concat = jnp.concatenate(suffix_tokens, axis=1)
@@ -591,11 +500,10 @@ class Pi0(_model.BaseModel):
             # 添加这一段的 action tokens (10个)
             tokens_parts.append(suffix_tokens_concat[:, start_idx:end_idx, :])
             # 添加对应的 cls token (1个)
-            tokens_parts.append(suf_cls_tokens[:, i:i+1, :])
+            tokens_parts.append(suf_cls_tokens[:, i:i + 1, :])
 
         suffix_tokens = jnp.concatenate(tokens_parts, axis=1)
 
-        
         suffix_input_mask.append(jnp.ones(suffix_tokens.shape[:2], dtype=jnp.bool_))
 
         suffix_mask = jnp.concatenate(suffix_input_mask, axis=1)
@@ -606,15 +514,13 @@ class Pi0(_model.BaseModel):
         positions = jnp.tile(jnp.arange(11), 5)[None, :]  # shape: (1, 55)
         positions = jnp.broadcast_to(positions, (batch_size, 55))
 
-        (suffix_out,), _ = self.PaliGemma.act_cls_head(
+        (suffix_out,), _ = self.PaliGemma.action_cls_head(
             [suffix_tokens],
             mask=suffix_attn_mask,
             positions=positions,
             kv_cache=None,
             adarms_cond=[None],
         )
-
-
 
         obs_cls_out = jnp.stack(
             [getattr(self.obs_cls_proj, f"head_{i}")(prefix_out[:, :1, :]) for i in range(self.cls_head_count)],
@@ -624,7 +530,7 @@ class Pi0(_model.BaseModel):
 
         act_cls_out = jnp.stack(
             [
-                getattr(self.act_cls_proj, f"head_{i}")(suffix_out[:, i*11+10: i*11+11, :])
+                getattr(self.act_cls_proj, "head_0")(suffix_out[:, i * 11 + 10: i * 11 + 11, :])
                 for i in range(self.cls_head_count)
             ],
             axis=1,
@@ -635,43 +541,25 @@ class Pi0(_model.BaseModel):
         vicreg = vicreg_loss(
             obs_cls_out,
             act_cls_out,
-            lambda_param=50*jax.nn.sigmoid(t_step/300-3),
+            lambda_param=50 * jax.nn.sigmoid(t_step / 300 - 3),
             mu_param=50.0,
             nu_param=1.0,
             gamma=0.5,  # 降低到现实可达的目标，避免与协方差损失冲突
         )
 
-        # jax.debug.print("act_cls_heads sample={x}", x=act_cls_out[0, 0, :])
-        # jax.debug.print("obs_cls_heads sample={x}", x=obs_cls_out[0, 0, :])
-        # jax.debug.print("actions sample={x}", x=actions[0, 0, :])
-        # jax.debug.print("shape={x}", x=act_cls_out.shape)
-
-        return jnp.mean(vicreg, axis=-1)
-
-    def _apply_obs_cls_head(
-            self,
-            head_idx: at.Int[at.Array, ""],
-            representation: at.Float[at.Array, "b 1 emb"],
-    ) -> at.Float[at.Array, "b 1 256"]:
-        """Apply the selected observation CLS head using JAX control flow."""
-        branches = tuple(
-            lambda rep, module=getattr(self.obs_cls_proj, f"head_{i}"): module(rep)
-            for i in range(self.cls_head_count)
-        )
-        head_idx = jnp.asarray(head_idx, dtype=jnp.int32)
-        return lax.switch(head_idx, branches, representation)
+        return vicreg
 
     @override
     def sample_actions(
-            self,
-            rng: at.KeyArrayLike,
-            observation: _model.Observation,
-            *,
-            num_steps: int | at.Int[at.Array, ""] = 10,
-            noise: at.Float[at.Array, "b ah ad"] | None = None,
-            old_obs_cls_repr: at.Float[at.Array, "hd"] = None,
-            force_sample: bool = False,
-            delta_replan: int = 0,
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        *,
+        num_steps: int | at.Int[at.Array, ""] = 10,
+        noise: at.Float[at.Array, "b ah ad"] | None = None,
+        old_obs_cls_repr: at.Float[at.Array, "hd"] = None,
+        force_sample: bool = False,
+        delta_replan: int = 0,
     ) -> (_model.Actions, at.Float[at.Array, "hd"], bool):
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
@@ -682,12 +570,15 @@ class Pi0(_model.BaseModel):
             noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
 
         # first fill KV cache with a forward pass of the prefix
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
-        prefix_attn_mask = make_attn_mask_pre(prefix_mask, prefix_ar_mask)
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation, with_cls=True)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        (prefix_out, _), kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
 
-        (prefix_out, _), kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask,
-                                                       positions=positions)
+        cache_k, cache_v = kv_cache
+        cache_k = cache_k[:, :, :-1, :, :]  # 去掉序列维度的最后一个
+        cache_v = cache_v[:, :, :-1, :, :]  # 去掉序列维度的最后一个
+        kv_cache = (cache_k, cache_v)
 
         now_obs_cls_repr = prefix_out[0, 0]
         head_idx = jnp.minimum(delta_replan, self.cls_head_count - 1)
@@ -698,6 +589,7 @@ class Pi0(_model.BaseModel):
         )
         now_obs_cls_head = getattr(self.obs_cls_proj, "head_0")(now_obs_cls_repr)
 
+
         def step(carry):
             x_t, time = carry
             suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
@@ -705,7 +597,7 @@ class Pi0(_model.BaseModel):
             )
             # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to each
             # other
-            suffix_attn_mask = make_attn_mask_pre(suffix_mask, suffix_ar_mask)
+            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
             # `prefix_attn_mask` is shape (b, suffix_len, prefix_len) indicating how the suffix tokens can attend to the
             # prefix tokens
             prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
@@ -728,9 +620,7 @@ class Pi0(_model.BaseModel):
                 adarms_cond=[None, adarms_cond],
             )
             assert prefix_out is None
-            v_t = self.action_out_proj(
-                suffix_out[:, -self.action_horizon  : ]
-            )
+            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
             return x_t + dt * v_t, time + dt
 
@@ -743,18 +633,16 @@ class Pi0(_model.BaseModel):
             x_t, time = carry
             return x_t, time
 
-        if old_obs_cls_head is not None:
-            jax.debug.print("old_obs_cls_head={a}", a=old_obs_cls_head[:20])
-            jax.debug.print("now_obs_cls_head={a}", a=now_obs_cls_head[:20])
-            jax.debug.print("now_obs_cls_repr={a}", a=now_obs_cls_repr[:20])
+        # if old_obs_cls_head is not None:
+        #     jax.debug.print("old_obs_cls_head={a}", a=old_obs_cls_head[:20])
+        #     jax.debug.print("now_obs_cls_head={a}", a=now_obs_cls_head[:20])
+        #     jax.debug.print("now_obs_cls_repr={a}", a=now_obs_cls_repr[:20])
         if old_obs_cls_head is not None:
             # Use L2 distance instead of cosine similarity
             l2_distance = jnp.mean(jnp.square(now_obs_cls_head - old_obs_cls_head), axis=-1)
             # 使用L2距离阈值（需要根据实际表征尺度调整）
-            should_sample = l2_distance > 0.1
+            should_sample = l2_distance > 0.3
             jax.debug.print("l2_distance={a}", a=l2_distance)
-            #jax.debug.print("now_obs_cls_heads sample={a}", a=now_obs_cls_heads[:50])
-            #jax.debug.print("old_obs_cls_head sample={a}", a=old_obs_cls_head[:50])
         else:
             # If old_obs_cls_head is None, always sample
             should_sample = jnp.array(True)
