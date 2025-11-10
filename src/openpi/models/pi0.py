@@ -562,6 +562,19 @@ class Pi0(_model.BaseModel):
 
         return vicreg
 
+    def _apply_obs_cls_head(
+            self,
+            head_idx: at.Int[at.Array, ""],
+            representation: at.Float[at.Array, "b 1 emb"],
+    ) -> at.Float[at.Array, "b 1 256"]:
+        """Apply the selected observation CLS head using JAX control flow."""
+        branches = tuple(
+            lambda rep, module=getattr(self.obs_cls_proj, f"head_{i}"): module(rep)
+            for i in range(self.cls_head_count)
+        )
+        head_idx = jnp.asarray(head_idx, dtype=jnp.int32)
+        return lax.switch(head_idx, branches, representation)
+
     @override
     def sample_actions(
         self,
