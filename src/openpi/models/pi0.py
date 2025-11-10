@@ -601,10 +601,10 @@ class Pi0(_model.BaseModel):
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
         (prefix_out, _), kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
 
-        cache_k, cache_v = kv_cache
-        cache_k = cache_k[:, :, :-1, :, :]  # 去掉序列维度的最后一个
-        cache_v = cache_v[:, :, :-1, :, :]  # 去掉序列维度的最后一个
-        kv_cache = (cache_k, cache_v)
+        # cache_k, cache_v = kv_cache
+        # cache_k = cache_k[:, :, :-1, :, :]  # 去掉序列维度的最后一个
+        # cache_v = cache_v[:, :, :-1, :, :]  # 去掉序列维度的最后一个
+        # kv_cache = (cache_k, cache_v)
 
         now_obs_cls_repr = prefix_out[0, 0]
         head_idx = jnp.minimum(delta_replan, self.cls_head_count - 1)
@@ -670,7 +670,7 @@ class Pi0(_model.BaseModel):
             # Use L2 distance instead of cosine similarity
             l2_distance = jnp.mean(jnp.square(now_obs_cls_head - old_obs_cls_head), axis=-1)
             # 使用L2距离阈值（需要根据实际表征尺度调整）
-            should_sample = l2_distance > 0.3
+            should_sample = l2_distance > 0.0
             jax.debug.print("l2_distance={a}", a=l2_distance)
         else:
             # If old_obs_cls_head is None, always sample
