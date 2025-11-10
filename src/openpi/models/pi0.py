@@ -588,13 +588,20 @@ class Pi0(_model.BaseModel):
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
         (prefix_out, _), kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
 
+        cache_k, cache_v = kv_cache
+        cache_k = cache_k[:, :, :-1, :, :]  # 去掉序列维度的最后一个
+        cache_v = cache_v[:, :, :-1, :, :]  # 去掉序列维度的最后一个
+        kv_cache = (cache_k, cache_v)
 
         now_obs_cls_repr = prefix_out[0, 0]
         head_idx = jnp.minimum(delta_replan, self.cls_head_count - 1)
+        # jax.debug.print("head_idx={a}", a=head_idx)
+
         old_obs_cls_head = (
             None
             if old_obs_cls_repr is None
             else self._apply_obs_cls_head(head_idx, old_obs_cls_repr)
+            # else self._apply_obs_cls_head(head_idx, now_obs_cls_repr)
         )
         now_obs_cls_head = getattr(self.obs_cls_proj, "head_0")(now_obs_cls_repr)
 
@@ -668,4 +675,3 @@ class Pi0(_model.BaseModel):
         #jax.debug.print("x_0={a}", a=x_0[1, :10,:7])
         #jax.debug.print("x_1={a}", a=x_0[1, 10:20, :7])
         return x_0, now_obs_cls_repr, should_sample
-        #return x_0, old_obs_cls_head
