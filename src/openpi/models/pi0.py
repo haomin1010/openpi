@@ -103,16 +103,22 @@ def vicreg_loss(z1, z2, lambda_param=25.0, mu_param=25.0, nu_param=1.0, gamma=1.
     offdiag_z1 = cov_z1 * off_diagonal_mask
     offdiag_z2 = cov_z2 * off_diagonal_mask
 
-    # Covariance loss
+    # Covariance loss (following VICReg paper: normalize by dim, not number of elements)
     cov_loss_z1 = jnp.sum(jnp.square(offdiag_z1)) / dim
     cov_loss_z2 = jnp.sum(jnp.square(offdiag_z2)) / dim
     covariance_loss = cov_loss_z1 + cov_loss_z2
 
     # Off-diagonal ratio diagnostics
-    fro_z1 = jnp.linalg.norm(cov_z1)
-    fro_z2 = jnp.linalg.norm(cov_z2)
-    ratio_z1 = jnp.linalg.norm(offdiag_z1) / (fro_z1 + eps)
-    ratio_z2 = jnp.linalg.norm(offdiag_z2) / (fro_z2 + eps)
+    # Compare average squared covariance vs average variance
+    diag_mean_sq_z1 = jnp.mean(jnp.square(jnp.diag(cov_z1)))  # mean of variances^2
+    diag_mean_sq_z2 = jnp.mean(jnp.square(jnp.diag(cov_z2)))
+    # Only average over actual off-diagonal elements (exclude masked diagonal)
+    num_offdiag = dim * (dim - 1)
+    offdiag_mean_sq_z1 = jnp.sum(jnp.square(offdiag_z1)) / num_offdiag
+    offdiag_mean_sq_z2 = jnp.sum(jnp.square(offdiag_z2)) / num_offdiag
+    # Ratio: should be close to 0 for decorrelated features
+    ratio_z1 = jnp.sqrt(offdiag_mean_sq_z1 / (diag_mean_sq_z1 + eps))
+    ratio_z2 = jnp.sqrt(offdiag_mean_sq_z2 / (diag_mean_sq_z2 + eps))
 
     # Summarize diagnostics
     jax.debug.print(
@@ -138,7 +144,14 @@ def vicreg_loss(z1, z2, lambda_param=25.0, mu_param=25.0, nu_param=1.0, gamma=1.
         c=mu_param * variance_loss
     )
     jax.debug.print(
-        "cov_offdiag_ratio z1={a}, z2={b}",
+        "cov_diag_avg_sq z1={a}, z2={b} | offdiag_avg_sq z1={c}, z2={d}",
+        a=diag_mean_sq_z1,
+        b=diag_mean_sq_z2,
+        c=offdiag_mean_sq_z1,
+        d=offdiag_mean_sq_z2,
+    )
+    jax.debug.print(
+        "cov_offdiag_ratio z1={a}, z2={b} (0=decorrelated, 1=highly correlated)",
         a=ratio_z1,
         b=ratio_z2,
     )
@@ -575,19 +588,13 @@ class Pi0(_model.BaseModel):
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
         (prefix_out, _), kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
 
-        cache_k, cache_v = kv_cache
-        cache_k = cache_k[:, :, :-1, :, :]  # 去掉序列维度的最后一个
-        cache_v = cache_v[:, :, :-1, :, :]  # 去掉序列维度的最后一个
-        kv_cache = (cache_k, cache_v)
 
         now_obs_cls_repr = prefix_out[0, 0]
         head_idx = jnp.minimum(delta_replan, self.cls_head_count - 1)
-        #jax.debug.print("head_idx={a}", a=head_idx)
         old_obs_cls_head = (
             None
             if old_obs_cls_repr is None
             else self._apply_obs_cls_head(head_idx, old_obs_cls_repr)
-            #else self._apply_obs_cls_head(head_idx, now_obs_cls_repr)
         )
         now_obs_cls_head = getattr(self.obs_cls_proj, "head_0")(now_obs_cls_repr)
 
@@ -661,3 +668,4 @@ class Pi0(_model.BaseModel):
         #jax.debug.print("x_0={a}", a=x_0[1, :10,:7])
         #jax.debug.print("x_1={a}", a=x_0[1, 10:20, :7])
         return x_0, now_obs_cls_repr, should_sample
+        #return x_0, old_obs_cls_head
