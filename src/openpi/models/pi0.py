@@ -101,7 +101,7 @@ def vicreg_loss(z1, z2, lambda_param=25.0, mu_param=25.0, nu_param=1.0, gamma=1.
         std_means_z1.append(jnp.mean(std_z1))
         std_means_z2.append(jnp.mean(std_z2))
 
-        var_loss = jnp.mean(jax.nn.relu(gamma + 0.1 - std_z1)) + jnp.mean(jax.nn.relu(gamma - std_z2))
+        var_loss = jnp.mean(jax.nn.relu(gamma - std_z1)) + jnp.mean(jax.nn.relu(gamma - std_z2))
         variance_losses.append(var_loss)
 
         z1_centered = z1_i - jnp.mean(z1_i, axis=0, keepdims=True)
@@ -329,7 +329,7 @@ class Pi0(_model.BaseModel):
             )
         )
         img.lazy_init(next(iter(config.fake_obs().images.values())), train=False, rngs=rngs)
-        self.PaliGemma = nnx.Dict(llm=llm, img=img, act_cls_head=action_cls_head)
+        self.PaliGemma = nnx.Dict(llm=llm, img=img, action_cls_head=action_cls_head)
         self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
         if config.pi05:
             self.time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
@@ -362,7 +362,7 @@ class Pi0(_model.BaseModel):
         # 添加两个可学习的参数（避免把初始化函数作为模块静态字段）
         self.pre_cls_param = nnx.Param(nnx.initializers.normal()(rngs(), (1, 1, paligemma_config.width)))
         self.suf_cls_param = nnx.Param(
-            nnx.initializers.normal()(rngs(), (1, self.cls_head_count, action_expert_config.width))
+            nnx.initializers.normal()(rngs(), (1, 1, action_expert_config.width))
         )
 
         # Learnable temperatures to scale CLS heads before VICReg
@@ -459,7 +459,8 @@ class Pi0(_model.BaseModel):
         ar_mask += [True] + ([False] * (self.action_horizon - 1))
         tokens = jnp.concatenate(tokens, axis=1)
 
-        #tokens = jnp.concatenate([tokens, jnp.repeat(self.suf_cls_param.value, repeats=tokens.shape[0], axis=0)],
+        # cls_param_list = jnp.repeat(self.suf_cls_param.value, repeats=5, axis=1)
+        # tokens = jnp.concatenate([tokens, jnp.repeat(cls_param_list, repeats=tokens.shape[0], axis=0)],
         #                         axis=-2)
         #ar_mask += [True] * self.cls_head_count
         #input_mask.append(jnp.ones((tokens.shape[0], self.cls_head_count), dtype=jnp.bool_))
@@ -577,7 +578,8 @@ class Pi0(_model.BaseModel):
 
         suffix_tokens.append(action_expert_tokens)
         suffix_tokens_concat = jnp.concatenate(suffix_tokens, axis=1)
-        suf_cls_tokens = jnp.repeat(self.suf_cls_param.value, repeats=suffix_tokens_concat.shape[0], axis=0)
+        suf_cls_value = jnp.repeat(self.suf_cls_param.value, 5, axis=1)
+        suf_cls_tokens = jnp.repeat(suf_cls_value, repeats=suffix_tokens_concat.shape[0], axis=0)
 
         # 将 suf_cls_tokens 的每个头插入到对应位置
         # suf_cls_tokens shape: (batch, 5, width)
