@@ -17,8 +17,10 @@ RealSense D435i 双相机封装
     cameras.close()
 """
 
+from __future__ import annotations
+
 import logging
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 
