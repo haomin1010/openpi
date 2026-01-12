@@ -5,11 +5,15 @@ Kinova Gen3 机器人 OpenPI 策略推理脚本
 使用 openpi 服务器进行 VLA 策略推理，控制 Kinova Gen3 机械臂执行任务。
 
 使用方法：
-    # 1. 在有 GPU 的机器上启动策略服务器
-    uv run scripts/serve_policy.py policy:checkpoint --policy.config=pi05_base --policy.dir=<checkpoint_path>
+    # 1. 在有 GPU 的机器上启动策略服务器（使用 pi05_kinova 配置）
+    uv run scripts/serve_policy.py policy:checkpoint --policy.config=pi05_kinova --policy.dir=gs://openpi-assets/checkpoints/pi05_base
 
     # 2. 在机器人控制电脑上运行此脚本
     python main.py --robot-ip 192.168.1.10 --remote-host <server_ip> --external-serial <cam1> --wrist-serial <cam2>
+
+配置说明：
+    - pi05_kinova: 使用 DROID 格式（7 DOF + 夹爪），输出绝对关节位置
+    - 也可以使用 pi05_droid checkpoint: --policy.dir=gs://openpi-assets/checkpoints/pi05_droid
 """
 
 import contextlib
@@ -66,10 +70,10 @@ class Args:
     open_loop_horizon: int = 8
     
     # 动作模式：
-    # - delta: 增量模式，action 是相对当前位置的增量（默认，与 openpi 输出兼容）
-    # - absolute: 绝对位置模式
+    # - absolute: 绝对位置模式（默认，与 pi05_kinova 配置兼容）
+    # - delta: 增量模式，action 是相对当前位置的增量
     # - velocity: 速度模式
-    action_mode: str = "delta"
+    action_mode: str = "absolute"
 
 
 @contextlib.contextmanager

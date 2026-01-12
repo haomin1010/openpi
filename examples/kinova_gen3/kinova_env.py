@@ -111,10 +111,10 @@ class KinovaConfig:
     control_frequency: int = DEFAULT_CONTROL_FREQUENCY
     
     # 动作模式：absolute, delta, velocity
-    # - absolute: action 是目标关节位置（弧度）
+    # - absolute: action 是目标关节位置（弧度）- 与 pi05_kinova 配置兼容
     # - delta: action 是相对当前位置的增量，target = current + action
     # - velocity: action 是关节速度，需要低延迟控制
-    action_mode: str = ActionMode.DELTA  # 默认使用增量模式（与 openpi 输出兼容）
+    action_mode: str = ActionMode.ABSOLUTE  # 默认使用绝对位置模式（与 pi05_kinova 输出兼容）
     
     # 初始位置（弧度）- 默认 home 位置
     home_position: tuple = (0.0, -0.26, 3.14, -2.27, 0.0, -0.96, 1.57)
