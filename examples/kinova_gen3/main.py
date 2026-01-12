@@ -27,7 +27,7 @@ from PIL import Image
 import tqdm
 import tyro
 
-from kinova_env import KinovaRobotEnv
+from kinova_env import KinovaRobotEnv, ActionMode
 
 faulthandler.enable()
 
@@ -64,6 +64,12 @@ class Args:
     # 从预测的 action chunk 中执行多少个动作后再查询服务器
     # 8 通常是个好默认值（约 0.5 秒的动作执行）
     open_loop_horizon: int = 8
+    
+    # 动作模式：
+    # - delta: 增量模式，action 是相对当前位置的增量（默认，与 openpi 输出兼容）
+    # - absolute: 绝对位置模式
+    # - velocity: 速度模式
+    action_mode: str = "delta"
 
 
 @contextlib.contextmanager
@@ -97,11 +103,13 @@ def main(args: Args):
     # 初始化机器人环境
     print(f"连接 Kinova 机械臂: {args.robot_ip}")
     print(f"连接夹爪控制器: {args.gripper_ip}")
+    print(f"动作模式: {args.action_mode}")
     env = KinovaRobotEnv(
         robot_ip=args.robot_ip,
         gripper_ip=args.gripper_ip,
         external_camera_serial=args.external_camera_serial,
         wrist_camera_serial=args.wrist_camera_serial,
+        action_mode=args.action_mode,
     )
     print("机器人环境创建成功!")
 

@@ -2,25 +2,38 @@
 Kinova Gen3 机器人环境
 
 与 openpi 兼容的 RobotEnv 实现，支持：
-- Kinova Gen3 7DOF 机械臂（关节位置控制）
+- Kinova Gen3 7DOF 机械臂
+- 多种动作模式：增量(delta)、绝对位置(absolute)、速度(velocity)
 - 双 RealSense D435i 相机
 - UDP 夹爪控制
 - 键盘急停（ESC/q）
 
 使用示例：
-    from kinova_env import KinovaRobotEnv
+    from kinova_env import KinovaRobotEnv, ActionMode
 
     env = KinovaRobotEnv(
         robot_ip="192.168.1.10",
         gripper_ip="192.168.1.43",
         external_camera_serial="123456789",
         wrist_camera_serial="987654321",
+        action_mode=ActionMode.DELTA,  # 与 openpi 输出兼容
     )
 
     obs = env.get_observation()
-    env.step(action)  # action: (8,) = 7 关节位置 + 1 夹爪
+    env.step(action)  # action: (8,) = 7 关节动作 + 1 夹爪
     env.reset()
     env.close()
+
+动作模式说明：
+    - ActionMode.DELTA: 增量模式（默认）
+      action[:7] 是相对当前关节位置的增量
+      target_position = current_position + action
+      
+    - ActionMode.ABSOLUTE: 绝对位置模式
+      action[:7] 是目标关节位置（弧度）
+      
+    - ActionMode.VELOCITY: 速度模式
+      action[:7] 是关节速度（弧度/秒）
 """
 
 import dataclasses
@@ -69,6 +82,13 @@ GRIPPER_FULL_ANGLE = 1872.0
 GRIPPER_SPEED = 20.0  # rad/s
 
 
+class ActionMode:
+    """动作模式"""
+    ABSOLUTE = "absolute"  # 绝对位置：action 直接是目标关节位置
+    DELTA = "delta"        # 增量位置：action 是相对当前位置的增量
+    VELOCITY = "velocity"  # 速度模式：action 是关节速度
+
+
 @dataclasses.dataclass
 class KinovaConfig:
     """Kinova 机器人配置"""
@@ -89,6 +109,12 @@ class KinovaConfig:
     
     # 控制配置
     control_frequency: int = DEFAULT_CONTROL_FREQUENCY
+    
+    # 动作模式：absolute, delta, velocity
+    # - absolute: action 是目标关节位置（弧度）
+    # - delta: action 是相对当前位置的增量，target = current + action
+    # - velocity: action 是关节速度，需要低延迟控制
+    action_mode: str = ActionMode.DELTA  # 默认使用增量模式（与 openpi 输出兼容）
     
     # 初始位置（弧度）- 默认 home 位置
     home_position: tuple = (0.0, -0.26, 3.14, -2.27, 0.0, -0.96, 1.57)
@@ -152,6 +178,7 @@ class KinovaRobotEnv:
         gripper_ip: str = "192.168.1.43",
         external_camera_serial: Optional[str] = None,
         wrist_camera_serial: Optional[str] = None,
+        action_mode: str = ActionMode.DELTA,
         config: Optional[KinovaConfig] = None,
     ):
         """
@@ -162,6 +189,10 @@ class KinovaRobotEnv:
             gripper_ip: Arduino 夹爪控制器 IP 地址
             external_camera_serial: 外部相机序列号
             wrist_camera_serial: 腕部相机序列号
+            action_mode: 动作模式，可选值：
+                - "delta": 增量模式，action 是相对当前位置的增量（默认，与 openpi 兼容）
+                - "absolute": 绝对位置模式，action 是目标关节位置
+                - "velocity": 速度模式，action 是关节速度
             config: 完整配置对象（如果提供，会覆盖其他参数）
         """
         # 配置
@@ -173,6 +204,7 @@ class KinovaRobotEnv:
                 gripper_ip=gripper_ip,
                 external_camera_serial=external_camera_serial,
                 wrist_camera_serial=wrist_camera_serial,
+                action_mode=action_mode,
             )
 
         self._is_connected = False
@@ -288,7 +320,11 @@ class KinovaRobotEnv:
         执行动作。
 
         Args:
-            action: (8,) 数组，前 7 个是关节位置（弧度），最后 1 个是夹爪位置 [0, 1]
+            action: (8,) 数组，前 7 个是关节动作，最后 1 个是夹爪位置 [0, 1]
+                   动作解释取决于 action_mode:
+                   - absolute: 目标关节位置（弧度）
+                   - delta: 相对当前位置的增量
+                   - velocity: 关节速度
         """
         if self._estop_triggered:
             logger.warning("急停已触发，忽略动作命令")
@@ -299,14 +335,44 @@ class KinovaRobotEnv:
             raise ValueError(f"动作维度应为 (8,)，但收到 {action.shape}")
 
         # 分离关节动作和夹爪动作
-        joint_positions = action[:7]  # 弧度
+        joint_action = action[:7]
         gripper_pos = float(action[7])  # [0, 1]
 
+        # 根据动作模式处理关节动作
+        if self._config.action_mode == ActionMode.ABSOLUTE:
+            # 绝对位置模式：直接使用 action 作为目标位置
+            target_positions = joint_action
+        elif self._config.action_mode == ActionMode.DELTA:
+            # 增量模式：target = current + delta
+            current_positions = self._get_current_joint_positions()
+            target_positions = current_positions + joint_action
+        elif self._config.action_mode == ActionMode.VELOCITY:
+            # 速度模式：使用速度控制（需要不同的控制接口）
+            self._send_joint_velocities(joint_action)
+            self._control_gripper(gripper_pos)
+            return
+        else:
+            raise ValueError(f"未知的动作模式: {self._config.action_mode}")
+
         # 执行关节位置控制
-        self._move_to_joint_positions(joint_positions)
+        self._move_to_joint_positions(target_positions)
 
         # 执行夹爪控制
         self._control_gripper(gripper_pos)
+
+    def _get_current_joint_positions(self) -> np.ndarray:
+        """
+        获取当前关节位置。
+
+        Returns:
+            np.ndarray: (7,) 当前关节位置（弧度）
+        """
+        feedback = self._base_cyclic.RefreshFeedback()
+        positions = np.array([
+            math.radians(actuator.position)
+            for actuator in feedback.actuators
+        ])
+        return positions
 
     def _move_to_joint_positions(self, target_positions: np.ndarray):
         """
@@ -328,6 +394,32 @@ class KinovaRobotEnv:
 
         # 执行动作（非阻塞）
         self._base.ExecuteAction(action)
+
+    def _send_joint_velocities(self, velocities: np.ndarray):
+        """
+        发送关节速度命令（低延迟控制）。
+
+        Args:
+            velocities: (7,) 关节速度（弧度/秒）
+        """
+        # 使用 BaseCyclic 进行低延迟速度控制
+        command = BaseCyclic_pb2.Command()
+        
+        # 获取当前状态作为基础
+        feedback = self._base_cyclic.RefreshFeedback()
+        
+        for i, vel in enumerate(velocities):
+            actuator_command = command.actuators.add()
+            actuator_command.position = feedback.actuators[i].position
+            actuator_command.velocity = math.degrees(vel)  # kortex 使用角度/秒
+            actuator_command.torque_joint = 0.0
+            actuator_command.command_id = feedback.actuators[i].command_id
+        
+        # 发送命令
+        try:
+            self._base_cyclic.Refresh(command)
+        except Exception as e:
+            logger.warning(f"速度控制命令发送失败: {e}")
 
     def _control_gripper(self, target_pos: float):
         """
@@ -447,6 +539,7 @@ def create_kinova_env(
     gripper_ip: str = "192.168.1.43",
     external_camera_serial: Optional[str] = None,
     wrist_camera_serial: Optional[str] = None,
+    action_mode: str = ActionMode.DELTA,
 ) -> KinovaRobotEnv:
     """
     创建 Kinova 机器人环境的便捷函数。
@@ -456,6 +549,7 @@ def create_kinova_env(
         gripper_ip: Arduino 夹爪控制器 IP 地址
         external_camera_serial: 外部相机序列号
         wrist_camera_serial: 腕部相机序列号
+        action_mode: 动作模式（delta/absolute/velocity）
 
     Returns:
         KinovaRobotEnv: 机器人环境实例
@@ -465,6 +559,7 @@ def create_kinova_env(
         gripper_ip=gripper_ip,
         external_camera_serial=external_camera_serial,
         wrist_camera_serial=wrist_camera_serial,
+        action_mode=action_mode,
     )
 
 
