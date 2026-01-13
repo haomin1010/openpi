@@ -45,11 +45,19 @@ from typing import Callable, Optional
 
 import numpy as np
 
+# 设置 protobuf 环境变量以兼容 kortex_api
+# kortex_api 需要 protobuf <= 3.20.x，但项目可能使用更新版本
+# 这个设置使用纯 Python 实现，性能较慢但兼容性更好
+import os
+if "PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION" not in os.environ:
+    os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
+
+
 # Kinova kortex API
 try:
     from kortex_api.autogen.client_stubs.BaseClientRpc import BaseClient
     from kortex_api.autogen.client_stubs.BaseCyclicClientRpc import BaseCyclicClient
-    from kortex_api.autogen.messages import Base_pb2, BaseCyclic_pb2, Common_pb2
+    from kortex_api.autogen.messages import Base_pb2, BaseCyclic_pb2, Common_pb2, Session_pb2
     from kortex_api.RouterClient import RouterClient
     from kortex_api.SessionManager import SessionManager
     from kortex_api.TCPTransport import TCPTransport
@@ -231,12 +239,17 @@ class KinovaRobotEnv:
         # 创建路由器
         self._router = RouterClient(self._transport, lambda e: logger.error(f"Router error: {e}"))
 
-        # 创建会话
+        # 创建会话信息对象
         self._session_manager = SessionManager(self._router)
-        session_info = self._session_manager.CreateSession(
-            self._config.username, self._config.password
-        )
-        logger.info(f"会话已创建: {session_info}")
+        create_session_info = Session_pb2.CreateSessionInfo()
+        create_session_info.username = self._config.username
+        create_session_info.password = self._config.password
+        create_session_info.session_inactivity_timeout = 60000  # 60秒（毫秒）
+        create_session_info.connection_inactivity_timeout = 2000  # 2秒（毫秒）
+
+        # 创建会话
+        session_result = self._session_manager.CreateSession(create_session_info)
+        logger.info(f"会话已创建: {session_result}")
 
         # 创建服务客户端
         self._base = BaseClient(self._router)

@@ -68,6 +68,8 @@ python realsense_camera.py --list
 
 ### 步骤 1: 启动策略服务器
 
+👋 **数据采集指南**：如果你需要采集训练数据，请查看 [数据采集文档](DATA_COLLECTION.md)。
+
 在有 GPU 的机器上启动 OpenPI 策略服务器：
 
 ```bash
