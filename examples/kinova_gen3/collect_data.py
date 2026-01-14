@@ -14,10 +14,10 @@ Kinova 机械臂数据收集脚本
     - （已关闭）增量数据保存：为保证采样节拍稳定，仅在停止录制时保存完整 episode
 
 数据格式：
-    - LIBERO 格式：agent_images, wrist_images, states (8D), actions (7D)
+    - LIBERO 格式：agent_images, wrist_images, states (8D), actions (8D)
       - agent_images: 外部相机图像（第三方相机，序列号: 406122070121）
       - wrist_images: 腕部相机图像（序列号: 401622070466）
-      - states: 8D [joint_pos(7), gripper(1)] - 7个关节角度（弧度）+ 夹爪状态
+      - states: 8D [joint_pos(7), gripper(1)] - 7个关节角度（弧度）+ 夹爪状态（0=开, 1=闭）
     - 回放格式：joint_positions (7D), gripper_pos, eef_pose, timestamp, action
     - 额外：训练数据也保存 timestamp（每帧相对录制开始的秒数），用于采样可靠性验证
     - 注意：gripper_pos 是二值状态（0.0=张开，1.0=闭合），不是连续的归一化角度值
@@ -257,7 +257,7 @@ class LiberoDataCollector:
             'agent_images': [],      # 外部相机（第三方相机，序列号: 406122070121）
             'wrist_images': [],      # 腕部相机（序列号: 401622070466）
             'states': [],            # 8D状态 [joint_pos(7), gripper(1)]
-            'actions': [],           # 7D动作
+            'actions': [],           # 8D动作（下一帧关节角+夹爪）
             'timestamp': [],         # 每帧时间戳（相对录制开始的秒数）
             'task': self.task_description,
             # 记录采集频率，便于后处理（例如 verify_data 生成视频时选用正确 FPS）
@@ -372,8 +372,9 @@ class LiberoDataCollector:
         从机器人环境获取当前观测，处理并保存为 LIBERO 格式。
         
         Args:
-            action_7d: 7 维动作数组，格式为 [vel(6), gripper(1)]
-                      注意：在手动拖动示教模式下，这个值可能一直是 0
+            action_7d: 兼容参数（可选）。
+                      训练数据的 actions 字段将使用“下一帧关节角度（7D）”来构造，
+                      因此这里传入的 action_7d 不再直接写入 libero_format 的 actions。
         
         处理流程：
             1. 获取观测（图像和机器人状态）
@@ -385,10 +386,9 @@ class LiberoDataCollector:
             7. （已取消增量保存）仅在停止录制时保存完整 episode
         
         数据格式说明：
-            - LIBERO 状态：8D [joint_1, joint_2, ..., joint_7, gripper] - 7个关节角度（弧度）+ 夹爪状态
-            - LIBERO 动作：7D [vel(6), gripper(1)]
-            - 夹爪状态：二值动作（张开/闭合），LIBERO 格式 +1=张开, -1=闭合；env 格式 0.0=张开, 1.0=闭合
-            - 注意：夹爪状态不是连续的归一化角度值，而是离散的张开/闭合两种动作状态
+            - LIBERO 状态：8D [joint_1, ..., joint_7, gripper]（关节角弧度 + 夹爪 0/1）
+            - LIBERO 动作：8D next_state(8)（即 actions[t] = states[t+1]；最后一帧重复最后状态补齐长度）
+            - 夹爪状态：二值 0/1（0=张开，1=闭合），符合 pi0_base 的 action space 约定
         """
         try:
             # 使用 env 获取观测
@@ -458,26 +458,24 @@ class LiberoDataCollector:
             cart_pos = robot_state['cartesian_position']  # (6,) [x, y, z, theta_x, theta_y, theta_z] (弧度) - 仅用于回放数据
             gripper_pos = robot_state['gripper_position']  # (1,) 夹爪状态：0.0=张开，1.0=闭合（二值动作，非连续角度值）
             
-            # 转换夹爪状态格式（二值动作：张开/闭合）
-            # LIBERO 格式: +1=张开, -1=闭合
-            # env 格式: 0.0=张开, 1.0=闭合（二值状态，非连续角度值）
-            libero_gripper = 1.0 if gripper_pos < 0.5 else -1.0
+            # 夹爪状态：使用 0/1（二值），与 pi0_base 约定一致
+            # env 格式: 0.0=张开, 1.0=闭合（二值）
+            gripper_bin = 0.0 if gripper_pos < 0.5 else 1.0
             
             # 构造 8D 状态数组 [joint_pos(7), gripper(1)]
             # 使用关节角度作为状态表示（7个关节角度 + 1个夹爪状态）
             state_8d = np.concatenate([
                 joint_pos,         # 7个关节角度（弧度）
-                [libero_gripper]   # 夹爪状态
+                [gripper_bin]      # 夹爪状态（0/1）
             ]).astype(np.float32)
             
-            # 构造 7D 动作数组
-            # 传入的 action_7d 格式为 [vel(6), gripper(1)]
-            # 注意：在手动拖动示教模式下，这个值可能一直是 0
-            action_final = np.array(action_7d).astype(np.float32)
+            # 训练数据的动作：使用“下一帧关节角度”作为当前帧 action。
+            # 因此这里先存一个占位（当前帧关节角度），在保存 episode 时整体向前平移一帧。
+            action_placeholder = np.asarray(state_8d, dtype=np.float32)
             
             # 保存数据
             self.continuous_episode_data['states'].append(state_8d)
-            self.continuous_episode_data['actions'].append(action_final)
+            self.continuous_episode_data['actions'].append(action_placeholder)
             self.continuous_episode_data['agent_images'].append(ext_img)
             self.continuous_episode_data['wrist_images'].append(wrist_img)
             self.continuous_episode_data['timestamp'].append(rel_t)
@@ -497,7 +495,8 @@ class LiberoDataCollector:
                     'joint_positions': joint_pos,  # (7,) 关节位置（弧度）
                     'eef_pose': np.concatenate([cart_pos[:3], quat]),  # (7,) 末端执行器位姿 [x,y,z,qx,qy,qz,qw]
                     'gripper_pos': gripper_pos,  # (1,) 夹爪状态：0.0=张开，1.0=闭合（二值动作）
-                    'action': action_final  # (7,) 动作数组
+                    # 与训练数据对齐：先保存当前状态占位，最终保存时会转成“下一帧状态”动作
+                    'action': action_placeholder  # (8,)
                 }
                 self.continuous_episode_data['replay_data'].append(replay_data)
                 
@@ -529,13 +528,26 @@ class LiberoDataCollector:
             self.episode_count += 1
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             libero_path = self.libero_dir / f"episode_{self.episode_count:03d}_libero_{timestamp}.npz"
+
+            # 将占位 actions（当前帧关节角）转换为训练用 actions（下一帧关节角）
+            # actions[t] = state[t+1]；最后一帧重复最后状态，保证长度与 states/images 一致。
+            actions_placeholder = np.asarray(self.continuous_episode_data['actions'], dtype=np.float32)
+            if actions_placeholder.ndim != 2 or actions_placeholder.shape[1] != 8:
+                raise ValueError(f"Unexpected actions placeholder shape: {actions_placeholder.shape}, expected (N, 8)")
+            actions_next = np.empty_like(actions_placeholder)
+            if len(actions_placeholder) > 1:
+                actions_next[:-1] = actions_placeholder[1:]
+                actions_next[-1] = actions_placeholder[-1]
+            else:
+                # 单帧 episode：无法构造下一帧动作，使用自身占位
+                actions_next[:] = actions_placeholder[:]
             
             np.savez_compressed(
                 libero_path,
                 agent_images=np.asarray(self.continuous_episode_data['agent_images'], dtype=np.uint8),
                 wrist_images=np.asarray(self.continuous_episode_data['wrist_images'], dtype=np.uint8),
                 states=np.asarray(self.continuous_episode_data['states'], dtype=np.float32),
-                actions=np.asarray(self.continuous_episode_data['actions'], dtype=np.float32),
+                actions=actions_next,
                 timestamp=np.asarray(self.continuous_episode_data['timestamp'], dtype=np.float64),
                 task=np.array(self.task_description),
                 collection_frequency=np.array(self.collection_frequency),
@@ -566,6 +578,24 @@ class LiberoDataCollector:
                 # - 'joint_positions': (N, 7) 数组
                 # - 'gripper_pos': (N,) 数组
                 saved_data = {k: np.array(v) for k, v in replay_dict.items()}
+                # 与训练数据一致：如果存在 joint_positions / gripper_pos，则覆盖 action 为“下一帧状态(8D)”
+                if 'joint_positions' in saved_data and 'gripper_pos' in saved_data:
+                    jp = np.asarray(saved_data['joint_positions'])
+                    gp = np.asarray(saved_data['gripper_pos'])
+                    # gp 可能是 (N,) 或 (N,1)
+                    gp = gp.reshape(-1)
+                    if jp.ndim == 2 and jp.shape[1] == 7 and len(jp) == len(gp):
+                        jp_next = np.empty_like(jp)
+                        gp_next = np.empty_like(gp)
+                        if len(jp) > 1:
+                            jp_next[:-1] = jp[1:]
+                            jp_next[-1] = jp[-1]
+                            gp_next[:-1] = gp[1:]
+                            gp_next[-1] = gp[-1]
+                        else:
+                            jp_next[:] = jp[:]
+                            gp_next[:] = gp[:]
+                        saved_data['action'] = np.concatenate([jp_next, gp_next[:, None]], axis=1)
                 # 保存采集频率（用于回放时使用正确的控制频率）
                 saved_data['collection_frequency'] = np.array(self.collection_frequency)
                 np.savez_compressed(str(replay_path), **saved_data)

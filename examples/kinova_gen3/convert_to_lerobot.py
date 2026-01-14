@@ -90,8 +90,8 @@ def main(
     # 定义特征结构，与 collect_data.py 中的保存格式对应
     # agent_images: (256, 256, 3)
     # wrist_images: (256, 256, 3)
-    # states: (8,) -> [x, y, z, qx, qy, qz, qw, gripper]
-    # actions: (7,) -> [vx, vy, vz, wx, wy, wz, gripper_cmd]
+    # states: (8,) -> [joint_pos(7), gripper(1)] 其中 gripper 为 0/1
+    # actions: (8,) -> 下一帧状态（actions[t] = states[t+1]，最后一帧重复补齐）
     
     dataset = LeRobotDataset.create(
         repo_id=full_repo_id,
@@ -115,7 +115,7 @@ def main(
             },
             "actions": {
                 "dtype": "float32",
-                "shape": (7,),
+                "shape": (8,),
                 "names": ["actions"],
             },
         },

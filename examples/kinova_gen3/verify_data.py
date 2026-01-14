@@ -92,13 +92,13 @@ def verify_data_format(data):
     else:
         print(f"❌ 状态格式错误: {states.shape}, 期望 (N, 8)")
     
-    # 检查动作格式 (应该是 7D)
+    # 检查动作格式 (应该是 8D: 7个关节 + 1个夹爪)
     actions = data['actions']
-    if len(actions.shape) == 2 and actions.shape[1] == 7:
+    if len(actions.shape) == 2 and actions.shape[1] == 8:
         checks['actions_format'] = True
-        print(f"✅ 动作格式正确: {actions.shape} (N, 7)")
+        print(f"✅ 动作格式正确: {actions.shape} (N, 8)")
     else:
-        print(f"❌ 动作格式错误: {actions.shape}, 期望 (N, 7)")
+        print(f"❌ 动作格式错误: {actions.shape}, 期望 (N, 8)")
     
     # 检查图像格式
     agent_images = data['agent_images']
@@ -192,7 +192,7 @@ def save_readable_data(data, output_dir):
     # 3. 保存动作数据 (CSV格式)
     actions_path = output_dir / "actions.csv"
     np.savetxt(actions_path, data['actions'], delimiter=',',
-               header='action_1,action_2,action_3,action_4,action_5,action_6,action_7',
+               header='joint_1,joint_2,joint_3,joint_4,joint_5,joint_6,joint_7,gripper',
                comments='', fmt='%.6f')
     print(f"  ✅ 动作数据: {actions_path}")
     

@@ -2,6 +2,38 @@
 
 本文档介绍如何使用 `collect_data.py` 脚本采集 Kinova Gen3 机械臂的演示数据。采集的数据格式兼容 LIBERO 和 OpenPi 训练流程。
 
+## 🧾 数据字段定义（强烈建议先读）
+
+采集输出分为两类：**训练数据**（`libero_format/*.npz`）与 **回放数据**（`replay_data/*.npz`）。
+
+### 训练数据：`libero_format/*.npz`（用于 OpenPI / pi0_base 微调）
+
+每个 `.npz` 对应一个 episode，包含以下字段：
+
+- **`agent_images`**：外部相机 RGB 图像序列，`(T, 256, 256, 3)`，`uint8`
+- **`wrist_images`**：腕部相机 RGB 图像序列，`(T, 256, 256, 3)`，`uint8`
+- **`states`**：机器人状态序列，`(T, 8)`，`float32`
+  - `states[t, 0:7]`：7 个关节角（**弧度**，绝对量）
+  - `states[t, 7]`：夹爪状态（**二值 0/1**，`0=开`，`1=闭`）
+- **`actions`**：训练标签动作序列，`(T, 8)`，`float32`
+  - **定义**：`actions[t] = states[t+1]`（即下一帧的绝对关节角 + 夹爪状态）
+  - **补齐规则**：最后一帧 `actions[T-1]` 重复 `states[T-1]`，保证长度与 `states/images` 一致
+- **`timestamp`**：每帧相对录制开始的时间戳（秒），`(T,)`，`float64`（用于采样可靠性验证，不参与训练特征）
+- **`collection_frequency`**：采集频率（Hz），标量（用于后处理/视频生成）
+- **`task`**：任务文本（字符串），用于生成训练时的 `prompt`（通常通过 `prompt_from_task=True`）
+
+### 回放数据：`replay_data/*.npz`（用于轨迹复现/调试）
+
+每个 `.npz` 同样对应一个 episode，通常包含：
+
+- **`joint_positions`**：`(T, 7)`，关节角（弧度）
+- **`gripper_pos`**：`(T,)` 或 `(T, 1)`，夹爪状态（0/1）
+- **`eef_pose`**：`(T, 7)`，末端位姿 `[x,y,z,qx,qy,qz,qw]`（用于平滑回放）
+- **`timestamp`**：`(T,)`，相对时间戳（秒）
+- **`step`**：`(T,)`，步数
+- **`action`**：`(T, 8)`，与训练数据一致的“下一帧状态”动作定义（用于对齐调试）
+- **`collection_frequency`**：标量（Hz）
+
 ## 📋 功能概述
 
 该脚本支持以下功能：
