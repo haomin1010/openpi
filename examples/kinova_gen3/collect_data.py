@@ -57,7 +57,7 @@ class LiberoDataCollector:
         
         # 初始化 Kinova 环境
         try:
-            logger.info(f"\nConnecting to robot at {self.robot_ip}...")
+            logger.info(f"Connecting to robot at {self.robot_ip}...\n")
             self.env = KinovaRobotEnv(
                 robot_ip=self.robot_ip,
                 gripper_ip=self.gripper_ip,
@@ -67,7 +67,7 @@ class LiberoDataCollector:
             )
             logger.info("✅ Robot environment initialized successfully\n")
         except Exception as e:
-            logger.error(f"\nFailed to initialize robot environment: {e}\n")
+            logger.error(f"Failed to initialize robot environment: {e}\n")
             sys.exit(1)
             
         # 数据收集状态
@@ -86,6 +86,12 @@ class LiberoDataCollector:
         # 键盘控制
         self.key_queue = queue.Queue()
         self.running = True
+        # 保存原始终端状态，用于程序退出时恢复
+        self.original_termios = None
+        try:
+            self.original_termios = termios.tcgetattr(sys.stdin.fileno())
+        except:
+            pass
         self.start_keyboard_listener()
         
         # 打印说明
@@ -129,7 +135,7 @@ class LiberoDataCollector:
     def start_recording(self):
         """开始录制"""
         if self.episode_count >= self.num_demonstrations:
-            logger.warning(f"\n已收集完所有演示 ({self.num_demonstrations})\n")
+            logger.warning(f"已收集完所有演示 ({self.num_demonstrations})\n")
             return
 
         logger.info("\n🎬 录制开始! (Recording started)\n")
@@ -204,10 +210,10 @@ class LiberoDataCollector:
         
         if success:
             remaining = self.num_demonstrations - self.episode_count
-            logger.info(f"📋 Episode saved! Remaining: {remaining}/{self.num_demonstrations}\n")
+            logger.info(f"\n📋 Episode saved! Remaining: {remaining}/{self.num_demonstrations}\n")
             
             if self.episode_count >= self.num_demonstrations:
-                logger.info(f"🎉 所有 {self.num_demonstrations} 条演示已收集完毕!\n")
+                logger.info(f"\n🎉 所有 {self.num_demonstrations} 条演示已收集完毕!\n")
                 self.create_summary()
 
     def collect_step_data(self, action_7d):
@@ -307,7 +313,7 @@ class LiberoDataCollector:
                 step_count=np.array(self.step_count)
             )
             logger.info(f"💾 Incremental data saved: {incremental_path.name}\n")
-            
+            sys.stdout.flush()  # 立即刷新，确保格式正确
         except Exception as e:
             logger.error(f"Failed to save incremental data: {e}\n")
 
@@ -486,8 +492,8 @@ class LiberoDataCollector:
             self.print_state()
         elif key == '\x1b': # ESC
             logger.info("\nExiting...\n")
-            self.cleanup()
             self.running = False
+            self.cleanup()
             sys.exit(0)
 
     def print_instructions(self):
@@ -522,16 +528,28 @@ class LiberoDataCollector:
                 old = termios.tcgetattr(fd)
                 try:
                     tty.setraw(fd)
-                    return sys.stdin.read(1)
+                    ch = sys.stdin.read(1)
+                    return ch
                 finally:
+                    # 确保恢复终端状态
                     termios.tcsetattr(fd, termios.TCSADRAIN, old)
-            except:
+                    # 刷新输出缓冲区，确保终端状态正确
+                    sys.stdout.flush()
+            except Exception as e:
+                # 如果出错，尝试恢复终端状态
+                try:
+                    if self.original_termios:
+                        termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, self.original_termios)
+                        sys.stdout.flush()
+                except:
+                    pass
                 return None
                 
         def listener():
             while self.running:
                 k = get_key()
-                if k: self.key_queue.put(k)
+                if k: 
+                    self.key_queue.put(k)
                 
         t = threading.Thread(target=listener, daemon=True)
         t.start()
@@ -544,8 +562,34 @@ class LiberoDataCollector:
                 pass
 
     def cleanup(self):
+        # 恢复终端状态（重要！确保退出后终端正常）
+        try:
+            if self.original_termios:
+                termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, self.original_termios)
+                sys.stdout.flush()
+        except:
+            pass
+        
         if self.env:
             self.env.close()
 
 if __name__ == "__main__":
-    LiberoDataCollector()
+    import signal
+    collector = None
+    
+    def signal_handler(sig, frame):
+        """处理 Ctrl+C 等信号，确保恢复终端状态"""
+        if collector:
+            collector.running = False
+            collector.cleanup()
+        sys.exit(0)
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    try:
+        collector = LiberoDataCollector()
+    except KeyboardInterrupt:
+        if collector:
+            collector.cleanup()
+        sys.exit(0)
