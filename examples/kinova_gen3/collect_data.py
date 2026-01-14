@@ -15,6 +15,9 @@ Kinova 机械臂数据收集脚本
 
 数据格式：
     - LIBERO 格式：agent_images, wrist_images, states (8D), actions (7D)
+      - agent_images: 外部相机图像（第三方相机，序列号: 406122070121）
+      - wrist_images: 腕部相机图像（序列号: 401622070466）
+      - states: 8D [joint_pos(7), gripper(1)] - 7个关节角度（弧度）+ 夹爪状态
     - 回放格式：joint_positions (7D), gripper_pos, eef_pose, timestamp, action
     - 注意：gripper_pos 是二值状态（0.0=张开，1.0=闭合），不是连续的归一化角度值
 
@@ -32,7 +35,6 @@ Kinova 机械臂数据收集脚本
     - kortex_api: Kinova 机器人 API
     - pyrealsense2: RealSense 相机支持
     - opencv-python: 图像处理
-    - scipy: 四元数转换
 """
 
 import sys
@@ -69,12 +71,12 @@ class LiberoDataCollector:
     
     负责从 Kinova 机械臂收集演示数据，包括：
     - 双相机图像（外部相机和腕部相机）
-    - 机器人状态（关节位置、末端位姿、夹爪状态）
+    - 机器人状态（关节角度、夹爪状态）
     - 动作数据（用于训练）
     - 回放数据（用于轨迹复现）
     
     数据保存格式：
-        - LIBERO 格式：用于训练的数据格式
+        - LIBERO 格式：用于训练的数据格式，状态为 8D [joint_pos(7), gripper(1)]
         - 回放格式：包含完整关节位置和位姿信息，用于轨迹回放
     
     属性：
@@ -113,14 +115,17 @@ class LiberoDataCollector:
         # 采集频率 (Hz)
         self.collection_frequency = 60
         
-        # 外部相机序列号（左侧）
-        self.external_camera_serial = None
+        # 外部相机序列号（第三方相机）
+        self.external_camera_serial = "406122070121"
         # 腕部相机序列号
-        self.wrist_camera_serial = None
+        self.wrist_camera_serial = "401622070466"
         
         # 初始化 Kinova 环境
         try:
             logger.info(f"Connecting to robot at {self.robot_ip}...\n")
+            logger.info(f"相机配置:")
+            logger.info(f"  - 外部相机（第三方）: {self.external_camera_serial}")
+            logger.info(f"  - 腕部相机: {self.wrist_camera_serial}\n")
             self.env = KinovaRobotEnv(
                 robot_ip=self.robot_ip,
                 gripper_ip=self.gripper_ip,
@@ -205,7 +210,17 @@ class LiberoDataCollector:
             'gripper_ip': self.gripper_ip,
             'num_demonstrations': self.num_demonstrations,
             'timestamp': timestamp,
-            'format': 'LIBERO-compatible'
+            'format': 'LIBERO-compatible',
+            'camera_config': {
+                'external_camera_serial': self.external_camera_serial,
+                'external_camera_type': '第三方相机',
+                'wrist_camera_serial': self.wrist_camera_serial,
+                'wrist_camera_type': '腕部相机'
+            },
+            'data_labels': {
+                'agent_images': '外部相机图像（第三方相机，序列号: {})'.format(self.external_camera_serial),
+                'wrist_images': '腕部相机图像（序列号: {})'.format(self.wrist_camera_serial)
+            }
         }
         
         info_path = self.session_dir / "session_info.json"
@@ -236,9 +251,9 @@ class LiberoDataCollector:
         
         # 初始化数据结构
         self.continuous_episode_data = {
-            'agent_images': [],      # 外部相机
-            'wrist_images': [],      # 腕部相机
-            'states': [],            # 8D状态
+            'agent_images': [],      # 外部相机（第三方相机，序列号: 406122070121）
+            'wrist_images': [],      # 腕部相机（序列号: 401622070466）
+            'states': [],            # 8D状态 [joint_pos(7), gripper(1)]
             'actions': [],           # 7D动作
             'task': self.task_description,
             'replay_data': []
@@ -258,7 +273,7 @@ class LiberoDataCollector:
         
         采集内容：
             - 相机图像（外部相机和腕部相机）
-            - 机器人状态（关节位置、末端位姿、夹爪状态）
+            - 机器人状态（关节角度、夹爪状态）- 用于训练的状态为 8D [joint_pos(7), gripper(1)]
             - 动作数据（last_executed_action）
         
         注意：
@@ -348,15 +363,14 @@ class LiberoDataCollector:
         处理流程：
             1. 获取观测（图像和机器人状态）
             2. 调整图像大小到 256x256 (LIBERO 标准)
-            3. 提取机器人状态（关节位置、末端位姿、夹爪状态）
-            4. 转换笛卡尔位姿为四元数
-            5. 构造 8D 状态 [eef_pos(3), eef_quat(4), gripper(1)]
-            6. 保存到连续 episode 数据中
-            7. 如果启用回放数据保存，同时保存回放数据
-            8. 每 50 步执行一次增量保存
+            3. 提取机器人状态（关节位置、夹爪状态）
+            4. 构造 8D 状态 [joint_pos(7), gripper(1)]
+            5. 保存到连续 episode 数据中
+            6. 如果启用回放数据保存，同时保存回放数据
+            7. 每 50 步执行一次增量保存
         
         数据格式说明：
-            - LIBERO 状态：8D [x, y, z, qx, qy, qz, qw, gripper]
+            - LIBERO 状态：8D [joint_1, joint_2, ..., joint_7, gripper] - 7个关节角度（弧度）+ 夹爪状态
             - LIBERO 动作：7D [vel(6), gripper(1)]
             - 夹爪状态：二值动作（张开/闭合），LIBERO 格式 +1=张开, -1=闭合；env 格式 0.0=张开, 1.0=闭合
             - 注意：夹爪状态不是连续的归一化角度值，而是离散的张开/闭合两种动作状态
@@ -369,12 +383,48 @@ class LiberoDataCollector:
             
             # 提取图像
             # 注意：KinovaRobotEnv 返回的 image 字典 key 格式为 "{serial_number}_left"
-            # 我们需要适配一下，假设第一个是外部相机，第二个是腕部相机
-            imgs = list(obs['image'].values())
-            # 简单假设：如果指定了 serial，就按 serial 找，否则按顺序
-            # 如果相机未连接，使用黑色图像占位
-            ext_img = imgs[0] if len(imgs) > 0 else np.zeros((256, 256, 3), dtype=np.uint8)
-            wrist_img = imgs[1] if len(imgs) > 1 else np.zeros((256, 256, 3), dtype=np.uint8)
+            # 根据配置的序列号正确识别相机
+            image_dict = obs['image']
+            
+            # 初始化图像变量
+            ext_img = None
+            wrist_img = None
+            
+            # 根据序列号提取外部相机图像（第三方相机）
+            if self.external_camera_serial:
+                external_key = f"{self.external_camera_serial}_left"
+                if external_key in image_dict:
+                    ext_img = image_dict[external_key]
+                    if self.step_count == 1:
+                        logger.info(f"✅ 外部相机已识别: {self.external_camera_serial}")
+                else:
+                    if self.step_count == 1:
+                        logger.warning(f"⚠️  外部相机未找到: {self.external_camera_serial}, 使用黑色占位图像")
+            
+            # 根据序列号提取腕部相机图像
+            if self.wrist_camera_serial:
+                wrist_key = f"{self.wrist_camera_serial}_left"
+                if wrist_key in image_dict:
+                    wrist_img = image_dict[wrist_key]
+                    if self.step_count == 1:
+                        logger.info(f"✅ 腕部相机已识别: {self.wrist_camera_serial}")
+                else:
+                    if self.step_count == 1:
+                        logger.warning(f"⚠️  腕部相机未找到: {self.wrist_camera_serial}, 使用黑色占位图像")
+            
+            # 如果序列号未配置或未找到，尝试按顺序获取（向后兼容）
+            if ext_img is None or wrist_img is None:
+                imgs = list(image_dict.values())
+                if ext_img is None:
+                    ext_img = imgs[0] if len(imgs) > 0 else np.zeros((256, 256, 3), dtype=np.uint8)
+                if wrist_img is None:
+                    wrist_img = imgs[1] if len(imgs) > 1 else np.zeros((256, 256, 3), dtype=np.uint8)
+            
+            # 确保图像不为 None
+            if ext_img is None:
+                ext_img = np.zeros((256, 256, 3), dtype=np.uint8)
+            if wrist_img is None:
+                wrist_img = np.zeros((256, 256, 3), dtype=np.uint8)
             
             # 调整图像大小到 256x256 (LIBERO 标准)
             # 注意: KinovaRobotEnv 获取的图像大小取决于其配置（默认 640x480）
@@ -388,26 +438,18 @@ class LiberoDataCollector:
             # 提取机器人状态
             robot_state = obs['robot_state']
             joint_pos = robot_state['joint_positions']  # (7,) 关节位置数组（弧度）
-            cart_pos = robot_state['cartesian_position']  # (6,) [x, y, z, theta_x, theta_y, theta_z] (弧度)
+            cart_pos = robot_state['cartesian_position']  # (6,) [x, y, z, theta_x, theta_y, theta_z] (弧度) - 仅用于回放数据
             gripper_pos = robot_state['gripper_position']  # (1,) 夹爪状态：0.0=张开，1.0=闭合（二值动作，非连续角度值）
-            
-            # 转换笛卡尔位姿：从欧拉角 [x,y,z,rx,ry,rz] 转为四元数 [x,y,z,qx,qy,qz,qw]
-            # KinovaRobotEnv 返回的是欧拉角 rx,ry,rz (弧度)
-            # LIBERO 格式需要四元数表示旋转
-            from scipy.spatial.transform import Rotation
-            r = Rotation.from_euler('xyz', cart_pos[3:], degrees=False)  # 从欧拉角创建旋转对象
-            quat = r.as_quat()  # (4,) 四元数 [x, y, z, w]
             
             # 转换夹爪状态格式（二值动作：张开/闭合）
             # LIBERO 格式: +1=张开, -1=闭合
             # env 格式: 0.0=张开, 1.0=闭合（二值状态，非连续角度值）
             libero_gripper = 1.0 if gripper_pos < 0.5 else -1.0
             
-            # 构造 8D 状态数组 [eef_pos(3), eef_quat(4), gripper(1)]
-            # LIBERO 格式要求的状态表示
+            # 构造 8D 状态数组 [joint_pos(7), gripper(1)]
+            # 使用关节角度作为状态表示（7个关节角度 + 1个夹爪状态）
             state_8d = np.concatenate([
-                cart_pos[:3],      # 位置 (x, y, z)
-                quat,              # 四元数 (qx, qy, qz, qw)
+                joint_pos,         # 7个关节角度（弧度）
                 [libero_gripper]   # 夹爪状态
             ]).astype(np.float32)
             
@@ -425,6 +467,12 @@ class LiberoDataCollector:
             # 保存回放数据（用于轨迹回放）
             # 回放数据包含完整的关节位置和位姿信息，用于精确复现轨迹
             if self.save_replay_data:
+                # 转换笛卡尔位姿：从欧拉角 [x,y,z,rx,ry,rz] 转为四元数 [x,y,z,qx,qy,qz,qw]
+                # 仅用于回放数据保存
+                from scipy.spatial.transform import Rotation
+                r = Rotation.from_euler('xyz', cart_pos[3:], degrees=False)  # 从欧拉角创建旋转对象
+                quat = r.as_quat()  # (4,) 四元数 [x, y, z, w]
+                
                 replay_data = {
                     'timestamp': time.time() - self.recording_start_time,  # 相对录制开始的时间戳
                     'step': self.step_count,  # 当前步数
@@ -452,7 +500,7 @@ class LiberoDataCollector:
         保存的数据包括：
             - agent_images: 外部相机图像 (N, 256, 256, 3) uint8
             - wrist_images: 腕部相机图像 (N, 256, 256, 3) uint8
-            - states: 8D 状态数组 (N, 8) float32
+            - states: 8D 状态数组 (N, 8) float32 [joint_pos(7), gripper(1)]
             - actions: 7D 动作数组 (N, 7) float32
             - task: 任务描述字符串
             - step_count: 当前步数
@@ -495,6 +543,7 @@ class LiberoDataCollector:
         
         注意：
             - 保存前会验证 LIBERO 格式
+            - LIBERO 格式的状态为 8D [joint_pos(7), gripper(1)]，使用关节角度而非末端位姿
             - 回放数据包含：joint_positions, eef_pose, gripper_pos, timestamp, step, action
             - gripper_pos 是二值状态（0.0=张开，1.0=闭合），记录的是张开/闭合动作，非连续角度值
         """
@@ -560,7 +609,7 @@ class LiberoDataCollector:
         检查的必需字段：
             - agent_images: 外部相机图像
             - wrist_images: 腕部相机图像
-            - states: 8D 状态数组
+            - states: 8D 状态数组 [joint_pos(7), gripper(1)]
             - actions: 7D 动作数组
             - task: 任务描述
         """
