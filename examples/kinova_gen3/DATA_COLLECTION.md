@@ -6,7 +6,7 @@
 
 该脚本支持以下功能：
 *   **多模态采集**：同步记录外部相机图像、腕部相机图像、机械臂状态（关节/末端）和夹爪状态。
-*   **固定频率**：支持以可调频率（默认 60Hz）进行稳定采样。
+*   **固定频率**：支持以可调频率（默认 30Hz，与 RealSense 默认 30fps 对齐）进行稳定采样。
 *   **示教模式**：支持记录手动拖动示教（Teaching mode）的过程。
 *   **数据格式**：直接生成 `.npz` 文件，包含训练所需的 observation 和 action。
 
@@ -124,7 +124,11 @@ data/
 
 **注意**：数据保存路径可在 `collect_data.py` 中修改 `self.data_dir` 变量。
 
-*   **`libero_format/*.npz`**：包含 `agent_images`, `wrist_images`, `states` (8D), `actions` (7D) 等字段，可直接用于 OpenPi 数据转换。
+*   **`libero_format/*.npz`**：包含训练所需字段，可直接用于 OpenPi 数据转换：
+    - `agent_images`, `wrist_images`：图像序列（uint8）
+    - `states` (8D), `actions` (7D)
+    - `timestamp`：每帧相对录制开始的秒数（用于采样可靠性验证，不参与训练特征）
+    - `collection_frequency`：采集频率（Hz，用于后处理/视频生成/回放节拍）
 
 ## 🔄 数据格式转换
 
@@ -142,6 +146,7 @@ uv run examples/kinova_gen3/convert_to_lerobot.py \
 
 *   `--data-dir`: **[必填]** 包含 `.npz` 文件的目录路径 (通常是采集数据下的 `libero_format` 目录)。
 *   `--repo-name`: 输出数据集名称，默认为 `kinova_gen3_dataset`。
+*   `--fps`: （可选）覆盖数据集 fps；默认从 `libero_format` 的 `collection_frequency` 推断（旧数据缺失时回退到 30Hz）。
 *   `--force-override`: 如果输出目录已存在，强制覆盖。
 *   `--push-to-hub`: 转换后自动上传到 Hugging Face Hub (需要登录)。
 
@@ -157,9 +162,26 @@ uv run examples/kinova_gen3/convert_to_lerobot.py \
 
 在 OpenPi 训练配置中，你可以直接使用该 `repo_name` 作为数据集 ID。
 
+## ✅ 数据验证（推荐）
+
+采集完成后建议先验证最新一条数据（检查 shape、字段、以及 `timestamp` 的采样间隔）：
+
+```bash
+# 方式 1：自动解析 data/ 下最新 session/libero_format 的最新 npz（默认行为）
+python examples/kinova_gen3/verify_data.py
+
+# 方式 2：显式指定 npz 路径
+python examples/kinova_gen3/verify_data.py data/<任务目录>/libero_format/<file>.npz
+```
+
+验证脚本会生成：
+- `agent_camera.mp4` / `wrist_camera.mp4` / `side_by_side_cameras.mp4`
+- `data_summary.json`、`states.csv`、`actions.csv` 等可读文件
+- 若存在 `timestamp`，还会打印采样间隔统计（用于判断是否有卡顿/跳帧）
+
 ## ⚠️ 注意事项
 
-*   **采集频率**：默认为 60Hz。如需调整，可修改脚本中 `self.collection_frequency` 的值。
+*   **采集频率**：默认为 30Hz（推荐与相机帧率一致）。如需调整，可修改脚本中 `self.collection_frequency` 的值。
 *   **有效性检查**：录制时间过短（< 5 帧）的数据会被自动丢弃。
 *   **相机对应**：脚本默认按检测顺序分配外部相机和腕部相机。如需指定，请在代码中设置 `external_camera_serial` 和 `wrist_camera_serial`。
 *   **数据目录**：数据保存路径在 `collect_data.py` 的 `self.data_dir` 变量中配置，默认为代码中硬编码的绝对路径。建议修改为相对路径（如 `./data` 或 `../data`）或根据实际需求设置。

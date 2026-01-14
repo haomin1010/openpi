@@ -4,14 +4,14 @@ Kinova 机械臂数据收集脚本
 
 基于 KinovaRobotEnv 实现的数据收集系统，用于收集真机演示数据，
 保持与 LIBERO 训练格式一致。支持键盘交互控制、实时数据采集、
-增量保存和完整 episode 保存。
+完整 episode 保存。
 
 主要功能：
-    - 实时数据采集（60Hz）
+    - 实时数据采集（默认 30Hz，与 RealSense 默认 30fps 对齐）
     - LIBERO 格式数据保存
     - 轨迹回放数据保存
     - 键盘交互控制（开始/停止录制、夹爪控制、机器人复位等）
-    - 增量数据保存（防止数据丢失）
+    - （已关闭）增量数据保存：为保证采样节拍稳定，仅在停止录制时保存完整 episode
 
 数据格式：
     - LIBERO 格式：agent_images, wrist_images, states (8D), actions (7D)
@@ -19,6 +19,7 @@ Kinova 机械臂数据收集脚本
       - wrist_images: 腕部相机图像（序列号: 401622070466）
       - states: 8D [joint_pos(7), gripper(1)] - 7个关节角度（弧度）+ 夹爪状态
     - 回放格式：joint_positions (7D), gripper_pos, eef_pose, timestamp, action
+    - 额外：训练数据也保存 timestamp（每帧相对录制开始的秒数），用于采样可靠性验证
     - 注意：gripper_pos 是二值状态（0.0=张开，1.0=闭合），不是连续的归一化角度值
 
 使用方式：
@@ -113,7 +114,9 @@ class LiberoDataCollector:
         self.save_replay_data = True
         
         # 采集频率 (Hz)
-        self.collection_frequency = 60
+        # RealSense 默认 30fps；将采集频率默认对齐到 30Hz，避免“采集 60Hz / 相机 30fps”
+        # 导致的重复帧、阻塞等待以及后处理视频帧率不一致等问题。
+        self.collection_frequency = 30
         
         # 外部相机序列号（第三方相机）
         self.external_camera_serial = "406122070121"
@@ -238,7 +241,7 @@ class LiberoDataCollector:
         
         注意：
             - 如果已达到最大演示数量，将不会开始新的录制
-            - 采集线程以 collection_frequency (默认 60Hz) 的频率运行
+            - 采集线程以 collection_frequency (默认 30Hz) 的频率运行
         """
         if self.episode_count >= self.num_demonstrations:
             logger.warning(f"已收集完所有演示 ({self.num_demonstrations})\n")
@@ -255,7 +258,10 @@ class LiberoDataCollector:
             'wrist_images': [],      # 腕部相机（序列号: 401622070466）
             'states': [],            # 8D状态 [joint_pos(7), gripper(1)]
             'actions': [],           # 7D动作
+            'timestamp': [],         # 每帧时间戳（相对录制开始的秒数）
             'task': self.task_description,
+            # 记录采集频率，便于后处理（例如 verify_data 生成视频时选用正确 FPS）
+            'collection_frequency': self.collection_frequency,
             'replay_data': []
         }
         self.is_recording = True
@@ -268,7 +274,7 @@ class LiberoDataCollector:
         """
         固定频率数据采集循环（后台线程）
         
-        以 collection_frequency (默认 60Hz) 的频率持续采集数据，
+        以 collection_frequency (默认 30Hz) 的频率持续采集数据，
         直到 is_recording 标志为 False。
         
         采集内容：
@@ -282,32 +288,41 @@ class LiberoDataCollector:
         """
         interval = 1.0 / self.collection_frequency
         logger.info(f"Starting data collection at {self.collection_frequency} Hz\n")
-        
-        next_time = time.time()
-        
+
+        # 使用单调时钟避免系统时间调整带来的抖动
+        next_time = time.perf_counter()
+        last_lag_log_t = next_time
+
         while self.is_recording:
+            now = time.perf_counter()
+            sleep_time = next_time - now
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
             # 记录当前动作（如果没有按键，则为全0）
             # 注意：在示教模式下，我们通常不记录键盘动作，而是记录机械臂的实际状态作为动作（如果是闭环）
             # 但在模仿学习数据采集中，如果是遥操作，action 是用户的输入。
             # 如果是手动拖动示教，action 通常是 下一时刻状态 - 当前状态 (delta) 或者 实际速度
             # 这里我们简单记录 last_executed_action，如果是手动拖动，这个值可能一直是0
             # TODO: 如果是手动拖动，这里的 action 可能需要改为记录实际关节速度/末端速度
-            
-            # 为了兼容性，我们暂且记录当前的 last_executed_action
-            # 或者是记录实际的机械臂反馈速度？KinovaRobotEnv 的 get_observation 返回了状态
-            # 我们在 collect_step_data 中处理
-            
             self.collect_step_data(self.last_executed_action)
-            
-            # 频率控制
+
+            # 频率控制：
+            # - 正常情况下按固定周期推进 next_time
+            # - 如果出现落后，不进行“追赶式补采”（会造成帧间隔不均匀），而是丢弃落后的周期，
+            #   将 next_time 重置到“当前时刻 + interval”，保证后续采样节奏稳定。
+            after = time.perf_counter()
             next_time += interval
-            sleep_time = next_time - time.time()
-            if sleep_time > 0:
-                time.sleep(sleep_time)
-            else:
-                # 采集太慢，跳过一些帧以赶上进度
-                # logger.warning(f"Collection lag: {-sleep_time*1000:.1f} ms")
-                pass
+            if after > next_time:
+                lag = after - next_time
+                # 限流打印，避免刷屏
+                if after - last_lag_log_t > 5.0:
+                    logger.warning(
+                        f"Collection loop is lagging by {lag*1000:.1f} ms; "
+                        f"skipping catch-up to keep frame timing stable."
+                    )
+                    last_lag_log_t = after
+                next_time = after + interval
 
     def stop_recording_and_save(self):
         """
@@ -367,7 +382,7 @@ class LiberoDataCollector:
             4. 构造 8D 状态 [joint_pos(7), gripper(1)]
             5. 保存到连续 episode 数据中
             6. 如果启用回放数据保存，同时保存回放数据
-            7. 每 50 步执行一次增量保存
+            7. （已取消增量保存）仅在停止录制时保存完整 episode
         
         数据格式说明：
             - LIBERO 状态：8D [joint_1, joint_2, ..., joint_7, gripper] - 7个关节角度（弧度）+ 夹爪状态
@@ -380,6 +395,8 @@ class LiberoDataCollector:
             obs = self.env.get_observation()
             
             self.step_count += 1
+            # 记录相对时间戳（用于训练数据可靠性验证）
+            rel_t = time.time() - self.recording_start_time
             
             # 提取图像
             # 注意：KinovaRobotEnv 返回的 image 字典 key 格式为 "{serial_number}_left"
@@ -463,6 +480,7 @@ class LiberoDataCollector:
             self.continuous_episode_data['actions'].append(action_final)
             self.continuous_episode_data['agent_images'].append(ext_img)
             self.continuous_episode_data['wrist_images'].append(wrist_img)
+            self.continuous_episode_data['timestamp'].append(rel_t)
             
             # 保存回放数据（用于轨迹回放）
             # 回放数据包含完整的关节位置和位姿信息，用于精确复现轨迹
@@ -483,48 +501,8 @@ class LiberoDataCollector:
                 }
                 self.continuous_episode_data['replay_data'].append(replay_data)
                 
-            # 增量保存
-            if self.step_count % 50 == 0:
-                self.save_incremental_data()
-                
         except Exception as e:
             logger.error(f"Failed to collect step data: {e}\n")
-
-    def save_incremental_data(self):
-        """
-        增量保存数据（防止数据丢失）
-        
-        将当前已收集的数据保存为增量备份文件，文件名包含步数和时间戳。
-        每 50 步自动调用一次。
-        
-        保存的数据包括：
-            - agent_images: 外部相机图像 (N, 256, 256, 3) uint8
-            - wrist_images: 腕部相机图像 (N, 256, 256, 3) uint8
-            - states: 8D 状态数组 (N, 8) float32 [joint_pos(7), gripper(1)]
-            - actions: 7D 动作数组 (N, 7) float32
-            - task: 任务描述字符串
-            - step_count: 当前步数
-        """
-        try:
-            if not self.continuous_episode_data or len(self.continuous_episode_data['states']) == 0:
-                return
-                
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            incremental_path = self.session_dir / f"incremental_data_step_{self.step_count}_{timestamp}.npz"
-            
-            np.savez_compressed(
-                incremental_path,
-                agent_images=np.asarray(self.continuous_episode_data['agent_images'], dtype=np.uint8),
-                wrist_images=np.asarray(self.continuous_episode_data['wrist_images'], dtype=np.uint8),
-                states=np.asarray(self.continuous_episode_data['states'], dtype=np.float32),
-                actions=np.asarray(self.continuous_episode_data['actions'], dtype=np.float32),
-                task=np.array(self.task_description),
-                step_count=np.array(self.step_count)
-            )
-            logger.info(f"💾 Incremental data saved: {incremental_path.name}\n")
-            sys.stdout.flush()  # 立即刷新，确保格式正确
-        except Exception as e:
-            logger.error(f"Failed to save incremental data: {e}\n")
 
     def save_complete_episode(self):
         """
@@ -558,7 +536,9 @@ class LiberoDataCollector:
                 wrist_images=np.asarray(self.continuous_episode_data['wrist_images'], dtype=np.uint8),
                 states=np.asarray(self.continuous_episode_data['states'], dtype=np.float32),
                 actions=np.asarray(self.continuous_episode_data['actions'], dtype=np.float32),
-                task=np.array(self.task_description)
+                timestamp=np.asarray(self.continuous_episode_data['timestamp'], dtype=np.float64),
+                task=np.array(self.task_description),
+                collection_frequency=np.array(self.collection_frequency),
             )
             
             # 验证

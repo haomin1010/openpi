@@ -29,6 +29,7 @@ logger = logging.getLogger("Converter")
 def main(
     data_dir: Path,
     repo_name: str = "kinova_gen3_dataset",
+    fps: Optional[int] = None,
     force_override: bool = False,
     push_to_hub: bool = False,
     hub_username: Optional[str] = None,
@@ -72,7 +73,20 @@ def main(
             logger.error(f"输出路径已存在: {output_path}. 使用 --force-override 覆盖。")
             return
 
-    # 3. 创建 LeRobot 数据集
+    # 3. 推断采集频率（用于 LeRobotDataset 的 fps 字段）
+    # 优先从第一个 npz 的 collection_frequency 读取；如果不存在则回退到 30Hz。
+    inferred_fps: int = 30
+    try:
+        first = np.load(npz_files[0], allow_pickle=True)
+        if "collection_frequency" in first:
+            inferred_fps = int(first["collection_frequency"])
+    except Exception:
+        # 推断失败则保持默认 30Hz
+        pass
+
+    dataset_fps = int(fps) if fps is not None else inferred_fps
+
+    # 4. 创建 LeRobot 数据集
     # 定义特征结构，与 collect_data.py 中的保存格式对应
     # agent_images: (256, 256, 3)
     # wrist_images: (256, 256, 3)
@@ -82,7 +96,7 @@ def main(
     dataset = LeRobotDataset.create(
         repo_id=full_repo_id,
         robot_type="kinova_gen3",
-        fps=60,  # collect_data.py 默认 60Hz，请根据实际情况确认
+        fps=dataset_fps,
         features={
             "image": {
                 "dtype": "image",
@@ -109,7 +123,7 @@ def main(
         image_writer_processes=5,
     )
 
-    # 4. 处理每个 episode
+    # 5. 处理每个 episode
     total_frames = 0
     
     for npz_file in npz_files:

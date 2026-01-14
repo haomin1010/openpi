@@ -163,7 +163,8 @@ class TrajectoryReplayer:
         if 'collection_frequency' in data:
             trajectory['collection_frequency'] = float(data['collection_frequency'])
         else:
-            trajectory['collection_frequency'] = 60.0  # 默认60Hz
+            # 旧数据可能不包含该字段；默认回退到 30Hz（与当前采集默认一致）
+            trajectory['collection_frequency'] = 30.0
         
         # 验证数据
         num_steps = len(trajectory['joint_positions'])
@@ -199,7 +200,7 @@ class TrajectoryReplayer:
         
         执行流程：
             1. 验证步数范围
-            2. 计算时间间隔（使用时间戳或固定频率 60Hz）
+            2. 计算时间间隔（优先使用时间戳；否则使用数据中记录的 collection_frequency）
             3. 移动到起始位置
             4. 按时间间隔逐步执行轨迹
             5. 显示回放进度（每 50 步）
@@ -227,13 +228,14 @@ class TrajectoryReplayer:
         # 计算时间间隔
         # 时间间隔用于控制回放速度，确保按照原始采集频率或时间戳回放
         num_actions = end_step - start_step
+        collection_frequency = trajectory.get('collection_frequency', 30.0)
         if timestamps is not None and len(timestamps) > 1:
             # 使用原始时间戳计算间隔（更精确）
             # 注意：时间戳数组长度应该与 joint_positions 相同
             if len(timestamps) != num_steps:
                 logger.warning(f"时间戳数组长度 ({len(timestamps)}) 与轨迹长度 ({num_steps}) 不匹配，使用固定频率")
                 # 时间戳不匹配，回退到固定频率
-                time_diffs = np.ones(num_actions) / 60.0 / playback_speed
+                time_diffs = np.ones(num_actions) / collection_frequency / playback_speed
             else:
                 # 计算相邻步骤之间的时间差
                 # np.diff 计算相邻元素差值，得到每步之间的时间间隔
@@ -241,9 +243,8 @@ class TrajectoryReplayer:
                 # 根据回放速度调整时间间隔
                 time_diffs = time_diffs / playback_speed
         else:
-            # 如果没有时间戳，使用固定频率（60Hz，与采集频率一致）
-            # 每步间隔 = 1/60 秒，再根据回放速度调整
-            time_diffs = np.ones(num_actions) / 60.0 / playback_speed
+            # 如果没有时间戳，使用采集频率（优先使用数据中记录的 collection_frequency）
+            time_diffs = np.ones(num_actions) / collection_frequency / playback_speed
         
         try:
             # 移动到起始位置
@@ -343,7 +344,7 @@ class TrajectoryReplayer:
         joint_positions = trajectory['joint_positions']
         gripper_positions = trajectory['gripper_positions']
         eef_poses = trajectory.get('eef_poses')
-        collection_frequency = trajectory.get('collection_frequency', 60.0)
+        collection_frequency = trajectory.get('collection_frequency', 30.0)
         
         num_steps = len(joint_positions)
         end_step = end_step if end_step is not None else num_steps

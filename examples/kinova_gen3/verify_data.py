@@ -12,6 +12,7 @@
 
 使用方式：
     python verify_data.py <npz_file_path>
+    python verify_data.py            # 默认解析 data/ 下最新 session 的 libero_format 中最新 npz
     
 示例：
     python verify_data.py data/General_manipulation_task_20260114_161043/libero_format/episode_001_libero_20260114_161101.npz
@@ -23,6 +24,37 @@ import numpy as np
 from pathlib import Path
 import cv2
 from datetime import datetime
+
+def find_latest_libero_npz(data_dir: Path) -> Path | None:
+    """
+    在 data_dir 下查找“最新 session/libero_format 目录中最新的 npz 文件”。
+
+    目录结构期望：
+        data/
+          <session_name_YYYYmmdd_HHMMSS>/
+            libero_format/
+              *.npz
+    """
+    if not data_dir.exists():
+        return None
+
+    # 找最新的 session（按目录 mtime）
+    session_dirs = [p for p in data_dir.iterdir() if p.is_dir()]
+    if not session_dirs:
+        return None
+    session_dirs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+
+    for session_dir in session_dirs:
+        libero_dir = session_dir / "libero_format"
+        if not libero_dir.exists():
+            continue
+        npz_files = list(libero_dir.glob("*.npz"))
+        if not npz_files:
+            continue
+        npz_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        return npz_files[0]
+
+    return None
 
 def load_data(npz_path):
     """加载 npz 数据文件"""
@@ -92,6 +124,24 @@ def verify_data_format(data):
         print(f"❌ 数据长度不一致: {lengths}")
     
     return checks
+
+def summarize_timestamps(data):
+    """如果存在 timestamp，输出采样可靠性统计信息（可选）"""
+    if "timestamp" not in data:
+        return
+    ts = np.asarray(data["timestamp"], dtype=np.float64)
+    if ts.ndim != 1 or len(ts) < 2:
+        print("⚠️  timestamp 字段存在但格式异常，期望 shape=(N,)")
+        return
+    dt = np.diff(ts)
+    # 基本健壮性检查：是否单调递增
+    nonmono = np.sum(dt <= 0)
+    if nonmono > 0:
+        print(f"⚠️  timestamp 非严格递增：存在 {nonmono} 个 dt<=0")
+    # 统计采样间隔
+    fps_est = 1.0 / np.median(dt) if np.all(dt > 0) else float("nan")
+    print(f"🕒 timestamp 统计：duration={ts[-1]-ts[0]:.3f}s, median_dt={np.median(dt):.4f}s, est_fps~{fps_est:.2f}")
+    print(f"   dt min/mean/max = {dt.min():.4f} / {dt.mean():.4f} / {dt.max():.4f} s")
 
 def save_readable_data(data, output_dir):
     """保存可读的数据文件"""
@@ -237,8 +287,9 @@ def save_videos(data, output_dir):
     agent_images = data['agent_images']
     wrist_images = data['wrist_images']
     
-    # 计算帧率（假设采集频率是60Hz，但视频通常用30fps）
-    fps = 60
+    # 使用数据中记录的采集频率作为视频 FPS（如果不存在则回退到 30）
+    # 这样可以避免“采集 30Hz/相机 30fps，但视频按 60fps 写入”导致的观感跳帧/加速。
+    fps = int(data["collection_frequency"]) if "collection_frequency" in data else 30
     
     # 生成外部相机视频
     agent_video_path = output_dir / "agent_camera.mp4"
@@ -278,13 +329,22 @@ def save_videos(data, output_dir):
         print(f"  ✅ 并排对比视频已保存: {side_by_side_path}")
 
 def main():
-    if len(sys.argv) < 2:
-        print("用法: python verify_data.py <npz_file_path>")
-        print("\n示例:")
-        print("  python verify_data.py data/General_manipulation_task_20260114_161043/libero_format/episode_001_libero_20260114_161101.npz")
-        sys.exit(1)
-    
-    npz_path = Path(sys.argv[1])
+    # 1) 允许用户显式指定 npz 路径
+    # 2) 若未指定，则默认解析 examples/kinova_gen3/data 下最新 session 的 libero_format 中最新 npz
+    if len(sys.argv) >= 2:
+        npz_path = Path(sys.argv[1])
+    else:
+        script_dir = Path(__file__).parent
+        default_data_dir = script_dir / "data"
+        npz_path = find_latest_libero_npz(default_data_dir)
+        if npz_path is None:
+            print("用法: python verify_data.py <npz_file_path>")
+            print("或直接运行: python verify_data.py  (自动解析 data/ 下最新 session/libero_format 的最新 npz)")
+            print("\n示例:")
+            print("  python verify_data.py data/General_manipulation_task_20260114_161043/libero_format/episode_001_libero_20260114_161101.npz")
+            print(f"\n❌ 错误: 未在默认目录中找到 npz 文件: {default_data_dir}")
+            sys.exit(1)
+        print(f"未指定 npz 路径，自动选择最新数据文件: {npz_path}")
     
     if not npz_path.exists():
         print(f"❌ 错误: 文件不存在: {npz_path}")
@@ -298,6 +358,7 @@ def main():
     print("数据格式验证")
     print("=" * 80)
     checks = verify_data_format(data)
+    summarize_timestamps(data)
     
     # 确定输出目录（与npz文件同一目录）
     output_dir = npz_path.parent / f"{npz_path.stem}_verification"
