@@ -85,9 +85,11 @@ NUM_JOINTS = 7
 # 默认控制频率
 DEFAULT_CONTROL_FREQUENCY = 40  # Hz
 
-# 夹爪角度范围（完全打开/关闭需要的角度）
-GRIPPER_FULL_ANGLE = 1872.0
+# 夹爪角度范围（完全闭合需要的角度）
+GRIPPER_FULL_ANGLE = 2040.0  # 完全闭合所需角度（度）
 GRIPPER_SPEED = 20.0  # rad/s
+# 初始化时完全张开的角度（确保完全张开）
+GRIPPER_INIT_OPEN_ANGLE = 2100.0  # 初始化张开角度（度）
 
 
 class ActionMode:
@@ -218,13 +220,16 @@ class KinovaRobotEnv:
         self._is_connected = False
         self._estop_triggered = False
         
-        # 当前夹爪状态 [0, 1]，0=张开，1=闭合
+        # 当前夹爪状态：0.0=张开，1.0=闭合（二值动作，非连续角度值）
         self._current_gripper_pos = 0.0
 
         # 初始化组件
         self._init_robot()
         self._init_cameras()
         self._init_estop()
+        
+        # 初始化时完全张开夹爪（2100°），确保绝对角度值对应
+        self._initialize_gripper()
 
         logger.info("KinovaRobotEnv 初始化完成")
 
@@ -276,6 +281,33 @@ class KinovaRobotEnv:
     def _init_estop(self):
         """初始化急停功能"""
         self._estop = EmergencyStop(callback=self._on_estop)
+    
+    def _initialize_gripper(self):
+        """
+        初始化夹爪：完全张开到 2100°
+        
+        在初始化阶段将夹爪完全张开，确保绝对角度值能够对应上。
+        使用直接角度控制，不通过归一化位置。
+        """
+        if not self._is_connected:
+            return
+        
+        logger.info("初始化夹爪：完全张开到 2100°...")
+        try:
+            # 直接发送张开命令：角度 2100°，速度负值表示张开
+            send_control(
+                host=self._config.gripper_ip,
+                port=self._config.gripper_port,
+                speed=-GRIPPER_SPEED,  # 负值表示张开
+                angle=GRIPPER_INIT_OPEN_ANGLE,  # 2100 度
+                timeout=2.0,  # 初始化时使用更长的超时
+            )
+            # 更新当前夹爪位置为 0.0（完全张开）
+            self._current_gripper_pos = 0.0
+            time.sleep(3.0)  # 等待夹爪完全张开
+            logger.info("夹爪已完全张开")
+        except Exception as e:
+            logger.warning(f"初始化夹爪失败: {e}")
 
     def _on_estop(self):
         """急停回调"""
@@ -333,11 +365,12 @@ class KinovaRobotEnv:
         执行动作。
 
         Args:
-            action: (8,) 数组，前 7 个是关节动作，最后 1 个是夹爪位置 [0, 1]
+            action: (8,) 数组，前 7 个是关节动作，最后 1 个是夹爪状态（0.0=张开，1.0=闭合）
                    动作解释取决于 action_mode:
                    - absolute: 目标关节位置（弧度）
                    - delta: 相对当前位置的增量
                    - velocity: 关节速度
+                   注意：夹爪状态是二值动作，实际使用中只有 0.0 和 1.0 两个值
         """
         if self._estop_triggered:
             logger.warning("急停已触发，忽略动作命令")
@@ -349,7 +382,7 @@ class KinovaRobotEnv:
 
         # 分离关节动作和夹爪动作
         joint_action = action[:7]
-        gripper_pos = float(action[7])  # [0, 1]
+        gripper_pos = float(action[7])  # 夹爪状态：0.0=张开，1.0=闭合（二值动作）
 
         # 根据动作模式处理关节动作
         if self._config.action_mode == ActionMode.ABSOLUTE:
@@ -436,10 +469,14 @@ class KinovaRobotEnv:
 
     def _control_gripper(self, target_pos: float):
         """
-        控制夹爪位置。
+        控制夹爪状态（张开/闭合）。
 
         Args:
-            target_pos: 目标位置 [0, 1]，0=张开，1=闭合
+            target_pos: 目标状态，0.0=张开，1.0=闭合（二值动作，非连续角度值）
+        
+        注意：
+            - 虽然函数接受 [0, 1] 范围的浮点数，但在实际使用中只接受 0.0 和 1.0 两个值
+            - 函数内部会将状态变化转换为角度变化量（delta * GRIPPER_FULL_ANGLE）来控制物理夹爪
         """
         target_pos = np.clip(target_pos, 0.0, 1.0)
 
@@ -480,8 +517,8 @@ class KinovaRobotEnv:
         home_positions = np.array(self._config.home_position)
         self._move_to_home(home_positions)
 
-        # 张开夹爪
-        self._control_gripper(0.0)
+        # 完全张开夹爪到 2100°（确保绝对角度值对应）
+        self._initialize_gripper()
 
         # 等待移动完成
         time.sleep(2.0)

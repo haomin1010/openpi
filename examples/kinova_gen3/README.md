@@ -133,7 +133,7 @@ python main.py \
 | 维度 | 内容 | 范围 |
 |------|------|------|
 | 0-6 | 7 个关节位置 | 弧度 |
-| 7 | 夹爪位置 | [0, 1]，0=张开，1=闭合 |
+| 7 | 夹爪状态 | 0.0=张开，1.0=闭合（二值动作，非连续角度值） |
 
 注意：本实现使用**关节位置控制**模式，策略输出的动作会被解释为目标关节位置。
 
@@ -144,7 +144,7 @@ python main.py \
 | `observation/exterior_image_1_left` | (224, 224, 3) uint8 | 外部相机 RGB 图像 |
 | `observation/wrist_image_left` | (224, 224, 3) uint8 | 腕部相机 RGB 图像 |
 | `observation/joint_position` | (7,) float | 关节位置（弧度） |
-| `observation/gripper_position` | (1,) float | 夹爪位置 |
+| `observation/gripper_position` | (1,) float | 夹爪状态：0.0=张开，1.0=闭合（二值动作） |
 
 ## 测试
 
