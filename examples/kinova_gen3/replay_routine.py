@@ -35,6 +35,8 @@ import numpy as np
 
 # 导入本地模块
 from kinova_env import KinovaRobotEnv, ActionMode
+from trajectory_smoothing import TrajectorySmoother
+from velocity_controller import CartesianVelocityController, create_twist_command, create_stop_command
 
 # 设置日志
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
@@ -157,12 +159,18 @@ class TrajectoryReplayer:
         else:
             trajectory['actions'] = None
         
+        # 采集频率（用于平滑回放）
+        if 'collection_frequency' in data:
+            trajectory['collection_frequency'] = float(data['collection_frequency'])
+        else:
+            trajectory['collection_frequency'] = 60.0  # 默认60Hz
+        
         # 验证数据
         num_steps = len(trajectory['joint_positions'])
         if num_steps == 0:
             raise ValueError("轨迹数据为空")
         
-        logger.info(f"轨迹数据加载完成: {num_steps} 步\n")
+        logger.info(f"轨迹数据加载完成: {num_steps} 步，采集频率: {trajectory['collection_frequency']} Hz\n")
         return trajectory
     
     def replay_trajectory(
@@ -285,6 +293,165 @@ class TrajectoryReplayer:
             logger.warning("\n回放被用户中断\n")
         except Exception as e:
             logger.error(f"回放过程中出错: {e}\n")
+            raise
+    
+    def _get_current_eef_pose(self) -> np.ndarray:
+        """
+        获取当前末端执行器位姿（从机器人反馈中获取）
+        
+        Returns:
+            末端执行器位姿数组 [x, y, z, qx, qy, qz, qw]（四元数格式）
+        """
+        from scipy.spatial.transform import Rotation
+        import math
+        
+        obs = self.env.get_observation()
+        cartesian_position = obs['robot_state']['cartesian_position']  # [x, y, z, rx, ry, rz] (欧拉角)
+        
+        # 转换为四元数
+        r = Rotation.from_euler('xyz', cartesian_position[3:], degrees=False)
+        quat = r.as_quat()  # [qx, qy, qz, qw]
+        
+        # 组合位置和四元数
+        eef_pose = np.concatenate([cartesian_position[:3], quat])
+        return eef_pose
+    
+    def replay_trajectory_smooth(
+        self,
+        trajectory: dict,
+        playback_speed: float = 1.0,
+        start_step: int = 0,
+        end_step: Optional[int] = None,
+        smoothing_window_size: int = 5,
+    ):
+        """
+        平滑轨迹回放（使用速度控制和平滑滤波）
+        
+        使用笛卡尔空间速度控制和平滑滤波实现更平滑的轨迹回放。
+        可用于VLA策略输出动作的执行。
+        
+        Args:
+            trajectory: 轨迹数据字典（由 load_trajectory 返回）
+            playback_speed: 回放速度倍数（1.0 = 原始速度）
+            start_step: 起始步数（默认从第0步开始）
+            end_step: 结束步数（默认到轨迹末尾，即 None）
+            smoothing_window_size: 平滑窗口大小（用于轨迹平滑的点数）
+        
+        Raises:
+            ValueError: 如果轨迹数据无效或缺少末端位姿信息
+        """
+        joint_positions = trajectory['joint_positions']
+        gripper_positions = trajectory['gripper_positions']
+        eef_poses = trajectory.get('eef_poses')
+        collection_frequency = trajectory.get('collection_frequency', 60.0)
+        
+        num_steps = len(joint_positions)
+        end_step = end_step if end_step is not None else num_steps
+        
+        if start_step < 0 or start_step >= num_steps:
+            raise ValueError(f"起始步数 {start_step} 超出范围 [0, {num_steps})")
+        if end_step <= start_step or end_step > num_steps:
+            raise ValueError(f"结束步数 {end_step} 无效")
+        
+        # 检查是否有末端位姿数据
+        if eef_poses is None:
+            raise ValueError("轨迹数据中缺少末端位姿信息（eef_pose），无法进行平滑回放")
+        
+        logger.info(f"开始平滑轨迹回放: 步数 {start_step} 到 {end_step} (共 {end_step - start_step} 步)")
+        logger.info(f"回放速度: {playback_speed}x，采集频率: {collection_frequency} Hz\n")
+        
+        # 初始化平滑器和速度控制器
+        smoother = TrajectorySmoother(window_size=smoothing_window_size)
+        velocity_controller = CartesianVelocityController(
+            max_linear_velocity=0.05,  # 5 cm/s
+            max_angular_velocity=0.5,  # rad/s
+            position_gain=2.0,
+            orientation_gain=1.0,
+        )
+        
+        # 计算控制周期（使用原始采集频率）
+        control_dt = 1.0 / collection_frequency / playback_speed
+        
+        try:
+            # 移动到起始位置（使用关节位置控制）
+            logger.info("移动到起始位置...")
+            start_joint_pos = joint_positions[start_step]
+            start_gripper_pos = gripper_positions[start_step]
+            start_action = np.concatenate([start_joint_pos, [start_gripper_pos]])
+            self.env.step(start_action)
+            time.sleep(1.0)  # 等待到达起始位置
+            
+            # 初始化平滑器（填充窗口）
+            current_eef_pose = self._get_current_eef_pose()
+            for _ in range(smoothing_window_size):
+                smoother.add_pose(current_eef_pose)
+            
+            logger.info("开始平滑回放...\n")
+            
+            # 回放轨迹
+            for i in range(start_step, end_step):
+                # 获取目标末端位姿
+                target_eef_pose = eef_poses[i]
+                target_gripper_pos = gripper_positions[i]
+                
+                # 添加到平滑器
+                smoother.add_pose(target_eef_pose)
+                
+                # 获取平滑后的目标位姿
+                smoothed_target_pose = smoother.get_smoothed_pose()
+                if smoothed_target_pose is None:
+                    # 窗口未满，使用原始目标位姿
+                    smoothed_target_pose = target_eef_pose
+                
+                # 获取当前位置
+                current_eef_pose = self._get_current_eef_pose()
+                
+                # 计算速度命令
+                linear_velocity, angular_velocity = velocity_controller.compute_velocity(
+                    current_eef_pose,
+                    smoothed_target_pose
+                )
+                
+                # 创建并发送速度命令
+                twist_cmd = create_twist_command(
+                    linear_velocity,
+                    angular_velocity,
+                    duration_ms=int(control_dt * 1000)
+                )
+                if twist_cmd is not None:
+                    self.env._base.SendTwistCommand(twist_cmd)
+                
+                # 控制夹爪（使用关节位置控制）
+                if abs(target_gripper_pos - self.env._current_gripper_pos) > 0.1:
+                    self.env._control_gripper(target_gripper_pos)
+                
+                # 等待控制周期
+                time.sleep(control_dt)
+                
+                # 显示进度（每 50 步显示一次）
+                if (i - start_step + 1) % 50 == 0:
+                    progress = (i - start_step + 1) / (end_step - start_step) * 100
+                    logger.info(f"回放进度: {progress:.1f}% ({i - start_step + 1}/{end_step - start_step})")
+            
+            # 停止机器人
+            stop_cmd = create_stop_command()
+            if stop_cmd is not None:
+                self.env._base.SendTwistCommand(stop_cmd)
+            
+            logger.info("\n平滑轨迹回放完成！\n")
+            
+        except KeyboardInterrupt:
+            logger.warning("\n回放被用户中断\n")
+            # 停止机器人
+            stop_cmd = create_stop_command()
+            if stop_cmd is not None:
+                self.env._base.SendTwistCommand(stop_cmd)
+        except Exception as e:
+            logger.error(f"回放过程中出错: {e}\n")
+            # 停止机器人
+            stop_cmd = create_stop_command()
+            if stop_cmd is not None:
+                self.env._base.SendTwistCommand(stop_cmd)
             raise
     
     def close(self):
@@ -487,6 +654,24 @@ def main():
         default=None,
         help='结束步数（默认: 到轨迹末尾）'
     )
+    parser.add_argument(
+        '--smooth',
+        action='store_true',
+        default=True,
+        help='使用平滑回放（速度控制和平滑滤波，默认启用）'
+    )
+    parser.add_argument(
+        '--no-smooth',
+        dest='smooth',
+        action='store_false',
+        help='禁用平滑回放（使用原始位置控制模式）'
+    )
+    parser.add_argument(
+        '--smoothing-window-size',
+        type=int,
+        default=5,
+        help='平滑窗口大小（用于轨迹平滑的点数，默认: 5）'
+    )
     
     # 数据目录
     parser.add_argument(
@@ -541,13 +726,22 @@ def main():
         # 加载轨迹数据
         trajectory = replayer.load_trajectory(trajectory_path)
         
-        # 执行轨迹回放
-        replayer.replay_trajectory(
-            trajectory,
-            playback_speed=args.playback_speed,
-            start_step=args.start_step,
-            end_step=args.end_step,
-        )
+        # 执行轨迹回放（根据参数选择平滑或原始模式）
+        if args.smooth:
+            replayer.replay_trajectory_smooth(
+                trajectory,
+                playback_speed=args.playback_speed,
+                start_step=args.start_step,
+                end_step=args.end_step,
+                smoothing_window_size=args.smoothing_window_size,
+            )
+        else:
+            replayer.replay_trajectory(
+                trajectory,
+                playback_speed=args.playback_speed,
+                start_step=args.start_step,
+                end_step=args.end_step,
+            )
         
     except KeyboardInterrupt:
         # 用户中断（Ctrl+C）

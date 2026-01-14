@@ -537,6 +537,8 @@ class LiberoDataCollector:
                 # - 'joint_positions': (N, 7) 数组
                 # - 'gripper_pos': (N,) 数组
                 saved_data = {k: np.array(v) for k, v in replay_dict.items()}
+                # 保存采集频率（用于回放时使用正确的控制频率）
+                saved_data['collection_frequency'] = np.array(self.collection_frequency)
                 np.savez_compressed(str(replay_path), **saved_data)
                 
             return True
