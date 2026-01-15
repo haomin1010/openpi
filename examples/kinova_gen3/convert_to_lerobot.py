@@ -5,7 +5,10 @@ Kinova Gen3 数据集转换脚本
 以便在 OpenPi 中进行训练。
 
 用法：
+    uv run examples/kinova_gen3/convert_to_lerobot.py
     uv run examples/kinova_gen3/convert_to_lerobot.py --data-dir /path/to/your/data/libero_format
+    uv run examples/kinova_gen3/convert_to_lerobot.py --data-dir /path/to/your/data/libero_format/episode_000_libero_xxx.npz
+    uv run examples/kinova_gen3/convert_to_lerobot.py --prompt "Grab the target object"
 
 依赖：
     需要安装 lerobot 和 tensorflow_datasets (如果使用 RLDS)
@@ -27,9 +30,10 @@ logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 logger = logging.getLogger("Converter")
 
 def main(
-    data_dir: Path,
+    data_dir: Optional[Path] = None,
     repo_name: str = "kinova_gen3_dataset",
     fps: Optional[int] = None,
+    prompt: Optional[str] = "Grab the target object",
     force_override: bool = False,
     push_to_hub: bool = False,
     hub_username: Optional[str] = None,
@@ -38,22 +42,42 @@ def main(
     将 Kinova 采集的 .npz 数据转换为 LeRobot 格式。
 
     Args:
-        data_dir: 包含 .npz 文件的目录 (通常是 .../libero_format)
+        data_dir: 指定要转换的目录或文件；为空时自动搜索 data/**/libero_format
         repo_name: 输出数据集的名称 (HF_LEROBOT_HOME/repo_name)
+        prompt: 统一设置数据集的任务指令；为 None 时使用 npz 内的 task 字段
         force_override: 是否覆盖已存在的输出数据集
         push_to_hub: 是否上传到 Hugging Face Hub
         hub_username: HF 用户名 (用于推送到 Hub)
     """
     
-    # 1. 检查输入目录
-    if not data_dir.exists():
-        logger.error(f"输入目录不存在: {data_dir}")
-        return
-        
-    npz_files = sorted(list(data_dir.glob("*_libero_*.npz")))
-    if not npz_files:
-        logger.error(f"在 {data_dir} 中未找到符合 *_libero_*.npz 模式的文件")
-        return
+    # 1. 收集输入文件
+    npz_files: list[Path] = []
+    if data_dir is None:
+        script_data_root = Path(__file__).resolve().parent / "data"
+        cwd_data_root = Path.cwd() / "data"
+        data_root = script_data_root if script_data_root.exists() else cwd_data_root
+        libero_dirs = sorted([p for p in data_root.rglob("libero_format") if p.is_dir()])
+        for libero_dir in libero_dirs:
+            npz_files.extend(sorted(libero_dir.glob("*_libero_*.npz")))
+        if not npz_files:
+            logger.error(
+                f"在 {data_root} 下未找到 libero_format 目录或 *_libero_*.npz 文件"
+            )
+            return
+    else:
+        if not data_dir.exists():
+            logger.error(f"输入路径不存在: {data_dir}")
+            return
+        if data_dir.is_file():
+            if data_dir.suffix != ".npz":
+                logger.error(f"输入文件不是 .npz: {data_dir}")
+                return
+            npz_files = [data_dir]
+        else:
+            npz_files = sorted(list(data_dir.glob("*_libero_*.npz")))
+            if not npz_files:
+                logger.error(f"在 {data_dir} 中未找到符合 *_libero_*.npz 模式的文件")
+                return
         
     logger.info(f"找到 {len(npz_files)} 个数据文件")
 
@@ -90,8 +114,8 @@ def main(
     # 定义特征结构，与 collect_data.py 中的保存格式对应
     # agent_images: (256, 256, 3)
     # wrist_images: (256, 256, 3)
-    # states: (8,) -> [joint_pos(7), gripper(1)] 其中 gripper 为 0/1
-    # actions: (8,) -> 下一帧状态（actions[t] = states[t+1]，最后一帧重复补齐）
+    # states: (32,) -> [joint_pos(7), gripper(1), padding(24)]
+    # actions: (32,) -> 下一帧状态（actions[t] = states[t+1]，最后一帧重复补齐）
     
     dataset = LeRobotDataset.create(
         repo_id=full_repo_id,
@@ -110,12 +134,12 @@ def main(
             },
             "state": {
                 "dtype": "float32",
-                "shape": (8,),
+                "shape": (32,),
                 "names": ["state"], # 具体含义见上文注释
             },
             "actions": {
                 "dtype": "float32",
-                "shape": (8,),
+                "shape": (32,),
                 "names": ["actions"],
             },
         },
@@ -137,17 +161,27 @@ def main(
             wrist_images = data['wrist_images']
             states = data['states']
             actions = data['actions']
-            task = str(data['task'])
+            task = prompt if prompt is not None else str(data['task'])
             
             num_frames = len(states)
             total_frames += num_frames
             
             for i in range(num_frames):
+                state = np.asarray(states[i], dtype=np.float32)
+                action = np.asarray(actions[i], dtype=np.float32)
+                if state.shape[-1] > 32 or action.shape[-1] > 32:
+                    raise ValueError(
+                        f"state/actions 维度超过 32: state={state.shape}, actions={action.shape}"
+                    )
+                if state.shape[-1] < 32:
+                    state = np.pad(state, (0, 32 - state.shape[-1]))
+                if action.shape[-1] < 32:
+                    action = np.pad(action, (0, 32 - action.shape[-1]))
                 dataset.add_frame({
                     "image": agent_images[i],
                     "wrist_image": wrist_images[i],
-                    "state": states[i],
-                    "actions": actions[i],
+                    "state": state,
+                    "actions": action,
                     "task": task,
                 })
             

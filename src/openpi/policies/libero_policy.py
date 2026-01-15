@@ -40,8 +40,8 @@ class LiberoInputs(transforms.DataTransformFn):
     model_type: _model.ModelType
 
     def __call__(self, data: dict) -> dict:
-        # Possibly need to parse images to uint8 (H,W,C) since LeRobot automatically
-        # stores as float32 (C,H,W), gets skipped for policy inference.
+        # Parse images to uint8 (H,W,C). LeRobot commonly stores images as float32 (C,H,W).
+        # Note: We convert uint8->float32 later in the model transforms (on CPU) to avoid GPU OOM.
         # Keep this for your own dataset, but if your dataset stores the images
         # in a different key than "observation/image" or "observation/wrist_image",
         # you should change it below.
