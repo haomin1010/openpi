@@ -232,12 +232,16 @@ def list_connected_cameras() -> list[str]:
 if __name__ == "__main__":
     # 测试代码：列出相机并尝试获取图像
     import argparse
+    import time
 
     parser = argparse.ArgumentParser(description="RealSense 相机测试")
     parser.add_argument("--list", action="store_true", help="列出所有连接的相机")
     parser.add_argument("--external-serial", type=str, help="外部相机序列号")
     parser.add_argument("--wrist-serial", type=str, help="腕部相机序列号")
     parser.add_argument("--save", action="store_true", help="保存测试图像")
+    parser.add_argument("--show", action="store_true", help="显示测试图像")
+    parser.add_argument("--live", action="store_true", help="实时显示视频流（按 'q' 退出）")
+    parser.add_argument("--frames", type=int, default=1, help="获取并显示的帧数（默认：1）")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO)
@@ -252,17 +256,136 @@ if __name__ == "__main__":
             wrist_serial=args.wrist_serial,
         )
 
-        print("获取图像帧...")
-        external_img, wrist_img = cameras.get_frames()
-        print(f"外部相机图像: {external_img.shape}, dtype={external_img.dtype}")
-        print(f"腕部相机图像: {wrist_img.shape}, dtype={wrist_img.dtype}")
+        # 实时显示模式
+        if args.live:
+            try:
+                import cv2
+                
+                print("\n开始实时显示（按 'q' 键退出）...")
+                frame_count = 0
+                start_time = time.time()
+                
+                while True:
+                    external_img, wrist_img = cameras.get_frames()
+                    
+                    # 转换为 BGR 格式（OpenCV 使用 BGR）
+                    external_bgr = cv2.cvtColor(external_img, cv2.COLOR_RGB2BGR)
+                    wrist_bgr = cv2.cvtColor(wrist_img, cv2.COLOR_RGB2BGR)
+                    
+                    # 计算 FPS
+                    frame_count += 1
+                    elapsed = time.time() - start_time
+                    fps = frame_count / elapsed if elapsed > 0 else 0
+                    
+                    # 在图像上添加信息
+                    fps_text = f"FPS: {fps:.1f}"
+                    cv2.putText(external_bgr, fps_text, (10, 30), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                    cv2.putText(external_bgr, f"Serial: {cameras._external_camera.device_serial}", 
+                               (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    cv2.putText(external_bgr, f"Frame: {frame_count}", 
+                               (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    
+                    cv2.putText(wrist_bgr, fps_text, (10, 30), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                    cv2.putText(wrist_bgr, f"Serial: {cameras._wrist_camera.device_serial}", 
+                               (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    cv2.putText(wrist_bgr, f"Frame: {frame_count}", 
+                               (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    
+                    # 显示图像
+                    cv2.imshow("外部相机 (External Camera)", external_bgr)
+                    cv2.imshow("腕部相机 (Wrist Camera)", wrist_bgr)
+                    
+                    # 每 30 帧打印一次统计信息
+                    if frame_count % 30 == 0:
+                        print(f"已处理 {frame_count} 帧，平均 FPS: {fps:.2f}")
+                    
+                    # 按 'q' 键退出
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        break
+                        
+                cv2.destroyAllWindows()
+                print(f"\n实时显示结束，共显示 {frame_count} 帧，平均 FPS: {fps:.2f}")
+                
+            except ImportError:
+                print("错误: OpenCV 未安装，无法实时显示。请运行: pip install opencv-python")
+            except KeyboardInterrupt:
+                print("\n用户中断")
+                try:
+                    cv2.destroyAllWindows()
+                except:
+                    pass
+            except Exception as e:
+                print(f"实时显示时出错: {e}")
+                try:
+                    cv2.destroyAllWindows()
+                except:
+                    pass
+            finally:
+                cameras.close()
+                print("\n相机已关闭")
+        # 原有的单帧/多帧显示模式
+        else:
+            print(f"\n获取 {args.frames} 帧图像...")
+            for frame_idx in range(args.frames):
+                print(f"\n--- 帧 {frame_idx + 1}/{args.frames} ---")
+                external_img, wrist_img = cameras.get_frames()
+                
+                # 打印图片信息
+                print(f"外部相机图像:")
+                print(f"  - 形状: {external_img.shape}")
+                print(f"  - 数据类型: {external_img.dtype}")
+                print(f"  - 数值范围: [{external_img.min()}, {external_img.max()}]")
+                print(f"  - 设备序列号: {cameras._external_camera.device_serial}")
+                
+                print(f"腕部相机图像:")
+                print(f"  - 形状: {wrist_img.shape}")
+                print(f"  - 数据类型: {wrist_img.dtype}")
+                print(f"  - 数值范围: [{wrist_img.min()}, {wrist_img.max()}]")
+                print(f"  - 设备序列号: {cameras._wrist_camera.device_serial}")
 
-        if args.save:
-            from PIL import Image
+                if args.save:
+                    from PIL import Image
 
-            Image.fromarray(external_img).save("external_camera_test.png")
-            Image.fromarray(wrist_img).save("wrist_camera_test.png")
-            print("测试图像已保存")
+                    external_path = f"external_camera_test_{frame_idx + 1}.png"
+                    wrist_path = f"wrist_camera_test_{frame_idx + 1}.png"
+                    Image.fromarray(external_img).save(external_path)
+                    Image.fromarray(wrist_img).save(wrist_path)
+                    print(f"测试图像已保存: {external_path}, {wrist_path}")
 
-        cameras.close()
+                if args.show:
+                    try:
+                        import matplotlib.pyplot as plt
+                        
+                        fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+                        
+                        axes[0].imshow(external_img)
+                        axes[0].set_title(f"外部相机 (序列号: {cameras._external_camera.device_serial})")
+                        axes[0].axis("off")
+                        
+                        axes[1].imshow(wrist_img)
+                        axes[1].set_title(f"腕部相机 (序列号: {cameras._wrist_camera.device_serial})")
+                        axes[1].axis("off")
+                        
+                        plt.tight_layout()
+                        plt.suptitle(f"帧 {frame_idx + 1}/{args.frames}", y=1.02)
+                        
+                        if args.frames == 1:
+                            # 单帧时阻塞显示
+                            print("显示图像窗口（关闭窗口继续）...")
+                            plt.show()
+                        else:
+                            # 多帧时短暂显示
+                            plt.show(block=False)
+                            plt.pause(1.0)
+                            plt.close()
+                            
+                    except ImportError:
+                        print("警告: matplotlib 未安装，无法显示图像。请运行: pip install matplotlib")
+                    except Exception as e:
+                        print(f"显示图像时出错: {e}")
+
+            cameras.close()
+            print("\n相机已关闭")
 

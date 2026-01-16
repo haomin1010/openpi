@@ -114,8 +114,8 @@ def main(
     # 定义特征结构，与 collect_data.py 中的保存格式对应
     # agent_images: (256, 256, 3)
     # wrist_images: (256, 256, 3)
-    # states: (32,) -> [joint_pos(7), gripper(1), padding(24)]
-    # actions: (32,) -> 下一帧状态（actions[t] = states[t+1]，最后一帧重复补齐）
+    # states: (32,) -> [joint_pos(7), gripper(1), padding(24)]，其中 gripper: 0=闭合，1=张开
+    # actions: (32,) -> 状态差值（actions[t] = states[t+1] - states[t]，最后一帧使用零向量补齐）
     
     dataset = LeRobotDataset.create(
         repo_id=full_repo_id,

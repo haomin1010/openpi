@@ -84,7 +84,7 @@ def verify_data_format(data):
         print(f"❌ 缺失字段: {missing_fields}")
         return checks
     
-    # 检查状态格式 (应该是 8D: 7个关节 + 1个夹爪)
+    # 检查状态格式 (应该是 8D: 7个关节 + 1个夹爪，夹爪：0=闭合，1=张开)
     states = data['states']
     if len(states.shape) == 2 and states.shape[1] == 8:
         checks['states_format'] = True
@@ -92,11 +92,12 @@ def verify_data_format(data):
     else:
         print(f"❌ 状态格式错误: {states.shape}, 期望 (N, 8)")
     
-    # 检查动作格式 (应该是 8D: 7个关节 + 1个夹爪)
+    # 检查动作格式 (应该是 8D: 7个关节 + 1个夹爪，夹爪：0=闭合，1=张开)
+    # 注意：actions 是 delta 形式，即 actions[t] = states[t+1] - states[t]
     actions = data['actions']
     if len(actions.shape) == 2 and actions.shape[1] == 8:
         checks['actions_format'] = True
-        print(f"✅ 动作格式正确: {actions.shape} (N, 8)")
+        print(f"✅ 动作格式正确: {actions.shape} (N, 8) - delta 形式")
     else:
         print(f"❌ 动作格式错误: {actions.shape}, 期望 (N, 8)")
     
@@ -208,8 +209,9 @@ def save_readable_data(data, output_dir):
             f.write(f"帧 {i}:\n")
             f.write(f"  状态 (8D): {data['states'][i]}\n")
             f.write(f"     - 关节角度 (7D): {data['states'][i][:7]}\n")
-            f.write(f"     - 夹爪状态: {data['states'][i][7]}\n")
-            f.write(f"  动作 (7D): {data['actions'][i]}\n")
+            f.write(f"     - 夹爪状态: {data['states'][i][7]} (0=闭合, 1=张开)\n")
+            f.write(f"  动作 (8D delta): {data['actions'][i]}\n")
+            f.write(f"     - 动作是状态差值: actions[t] = states[t+1] - states[t]\n")
             f.write("\n")
     
     print(f"  ✅ 数据样本: {sample_path}")
@@ -227,7 +229,7 @@ def save_readable_data(data, output_dir):
         f.write("检查项目:\n")
         f.write(f"  ✅ 必需字段: {'通过' if checks['required_fields'] else '失败'}\n")
         f.write(f"  ✅ 状态格式 (8D): {'通过' if checks['states_format'] else '失败'}\n")
-        f.write(f"  ✅ 动作格式 (7D): {'通过' if checks['actions_format'] else '失败'}\n")
+        f.write(f"  ✅ 动作格式 (8D delta): {'通过' if checks['actions_format'] else '失败'}\n")
         f.write(f"  ✅ 图像格式: {'通过' if checks['images_format'] else '失败'}\n")
         f.write(f"  ✅ 数据一致性: {'通过' if checks['data_consistency'] else '失败'}\n\n")
         

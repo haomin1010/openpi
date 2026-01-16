@@ -58,10 +58,10 @@ class TrajectoryReplayer:
     
     数据格式要求：
         - joint_positions: (N, 7) 关节位置数组（弧度）
-        - gripper_pos: (N,) 夹爪状态数组，0.0=张开，1.0=闭合（二值动作）
+        - gripper_pos: (N,) 夹爪状态数组，0.0=闭合，1.0=张开（二值动作）
         - timestamp: (N,) 时间戳数组（可选）
         - eef_pose: (N, 7) 末端执行器位姿（可选）
-        - action: (N, 7) 动作数组（可选）
+        - action: (N, 8) 动作数组（可选，delta 形式：actions[t] = states[t+1] - states[t]）
     
     属性：
         robot_ip (str): Kinova 机械臂 IP 地址
@@ -111,11 +111,11 @@ class TrajectoryReplayer:
         Returns:
             dict: 包含轨迹数据的字典，包含以下键：
                 - 'joint_positions': (N, 7) 关节位置数组（弧度）
-                - 'gripper_positions': (N,) 夹爪状态数组，0.0=张开，1.0=闭合（二值动作）
+                - 'gripper_positions': (N,) 夹爪状态数组，0.0=闭合，1.0=张开（二值动作）
                 - 'timestamps': (N,) 时间戳数组（可选，如果文件中存在）
                 - 'steps': (N,) 步数数组（可选）
                 - 'eef_poses': (N, 7) 末端执行器位姿（可选）
-                - 'actions': (N, 7) 动作数组（可选）
+                - 'actions': (N, 8) 动作数组（可选，delta 形式：actions[t] = states[t+1] - states[t]）
         
         Raises:
             FileNotFoundError: 如果轨迹文件不存在
@@ -124,7 +124,8 @@ class TrajectoryReplayer:
         注意：
             - 必需字段：joint_positions, gripper_pos
             - 可选字段：timestamp, step, eef_pose, action
-            - gripper_pos 是二值状态（0.0=张开，1.0=闭合），不是连续的归一化角度值
+            - gripper_pos 是二值状态（0.0=闭合，1.0=张开），不是连续的归一化角度值
+            - action 是 delta 形式（actions[t] = states[t+1] - states[t]），回放时未使用（仅用于记录）
         """
         if not data_path.exists():
             raise FileNotFoundError(f"轨迹文件不存在: {data_path}")
@@ -251,11 +252,13 @@ class TrajectoryReplayer:
             # 先移动到轨迹的起始位置，确保从正确的位置开始回放
             logger.info("移动到起始位置...")
             start_joint_pos = joint_positions[start_step]  # 起始关节位置（弧度）
-            start_gripper_pos = gripper_positions[start_step]  # 起始夹爪状态：0.0=张开，1.0=闭合
+            start_gripper_pos_data = gripper_positions[start_step]  # 起始夹爪状态（数据格式：0.0=闭合，1.0=张开）
+            # 转换为 env 格式：数据格式 0.0=闭合，1.0=张开 -> env 格式 0.0=张开，1.0=闭合
+            start_gripper_pos_env = 1.0 if start_gripper_pos_data < 0.5 else 0.0
             
-            # 构造动作：7个关节位置 + 1个夹爪状态（0.0=张开，1.0=闭合）
+            # 构造动作：7个关节位置 + 1个夹爪状态（env 格式：0.0=张开，1.0=闭合）
             # KinovaRobotEnv.step() 需要 (8,) 数组
-            start_action = np.concatenate([start_joint_pos, [start_gripper_pos]])
+            start_action = np.concatenate([start_joint_pos, [start_gripper_pos_env]])
             self.env.step(start_action)  # 使用绝对位置模式移动到起始位置
             time.sleep(1.0)  # 等待机器人到达起始位置
             
@@ -268,10 +271,12 @@ class TrajectoryReplayer:
                 # 注意：我们在第 i 步时执行第 i+1 步的目标位置
                 # 这样可以确保从当前位置平滑移动到下一个位置
                 target_joint_pos = joint_positions[i + 1]  # 下一步的目标关节位置（弧度）
-                target_gripper_pos = gripper_positions[i + 1]  # 下一步的目标夹爪状态：0.0=张开，1.0=闭合
+                target_gripper_pos_data = gripper_positions[i + 1]  # 下一步的目标夹爪状态（数据格式：0.0=闭合，1.0=张开）
+                # 转换为 env 格式：数据格式 0.0=闭合，1.0=张开 -> env 格式 0.0=张开，1.0=闭合
+                target_gripper_pos_env = 1.0 if target_gripper_pos_data < 0.5 else 0.0
                 
-                # 构造动作数组
-                action = np.concatenate([target_joint_pos, [target_gripper_pos]])
+                # 构造动作数组（env 格式：0.0=张开，1.0=闭合）
+                action = np.concatenate([target_joint_pos, [target_gripper_pos_env]])
                 
                 # 执行动作（使用绝对位置模式）
                 self.env.step(action)
@@ -377,8 +382,10 @@ class TrajectoryReplayer:
             # 移动到起始位置（使用关节位置控制）
             logger.info("移动到起始位置...")
             start_joint_pos = joint_positions[start_step]
-            start_gripper_pos = gripper_positions[start_step]
-            start_action = np.concatenate([start_joint_pos, [start_gripper_pos]])
+            start_gripper_pos_data = gripper_positions[start_step]  # 数据格式：0.0=闭合，1.0=张开
+            # 转换为 env 格式：数据格式 0.0=闭合，1.0=张开 -> env 格式 0.0=张开，1.0=闭合
+            start_gripper_pos_env = 1.0 if start_gripper_pos_data < 0.5 else 0.0
+            start_action = np.concatenate([start_joint_pos, [start_gripper_pos_env]])
             self.env.step(start_action)
             time.sleep(1.0)  # 等待到达起始位置
             
@@ -393,7 +400,9 @@ class TrajectoryReplayer:
             for i in range(start_step, end_step):
                 # 获取目标末端位姿
                 target_eef_pose = eef_poses[i]
-                target_gripper_pos = gripper_positions[i]
+                target_gripper_pos_data = gripper_positions[i]  # 数据格式：0.0=闭合，1.0=张开
+                # 转换为 env 格式：数据格式 0.0=闭合，1.0=张开 -> env 格式 0.0=张开，1.0=闭合
+                target_gripper_pos_env = 1.0 if target_gripper_pos_data < 0.5 else 0.0
                 
                 # 添加到平滑器
                 smoother.add_pose(target_eef_pose)
@@ -422,9 +431,9 @@ class TrajectoryReplayer:
                 if twist_cmd is not None:
                     self.env._base.SendTwistCommand(twist_cmd)
                 
-                # 控制夹爪（使用关节位置控制）
-                if abs(target_gripper_pos - self.env._current_gripper_pos) > 0.1:
-                    self.env._control_gripper(target_gripper_pos)
+                # 控制夹爪（使用关节位置控制，env 格式）
+                if abs(target_gripper_pos_env - self.env._current_gripper_pos) > 0.1:
+                    self.env._control_gripper(target_gripper_pos_env)
                 
                 # 等待控制周期
                 time.sleep(control_dt)
