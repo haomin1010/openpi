@@ -192,54 +192,6 @@ class ResizeImages(DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
-class ConvertImagesToFloat32Minus1To1(DataTransformFn):
-    """Ensure images are float32 in [-1, 1].
-
-    Why this exists:
-    - The training data loader will materialize a batch as JAX device arrays (GPU) before calling
-      `Observation.from_dict(...)`.
-    - If images are still uint8 at that point, `Observation.from_dict` will do a uint8->float32
-      conversion on GPU, which can transiently allocate large buffers and trigger CUDA OOM.
-    - Doing the conversion here keeps it on CPU (inside the dataset transform pipeline).
-
-    Notes:
-    - This transform is intentionally tolerant to multiple input conventions:
-      - uint8 images in [0, 255]
-      - float images in [0, 1]
-      - float images already in [-1, 1]
-    """
-
-    def __call__(self, data: DataDict) -> DataDict:
-        if "image" not in data:
-            return data
-
-        out: dict[str, np.ndarray] = {}
-        for k, v in data["image"].items():
-            x = np.asarray(v)
-            if np.issubdtype(x.dtype, np.integer):
-                x = x.astype(np.float32) / 255.0
-                x = x * 2.0 - 1.0
-            elif np.issubdtype(x.dtype, np.floating):
-                x = x.astype(np.float32)
-                x_min = float(np.nanmin(x))
-                x_max = float(np.nanmax(x))
-                # [0, 1] -> [-1, 1]
-                if x_min >= 0.0 and x_max <= 1.0 + 1e-3:
-                    x = x * 2.0 - 1.0
-                # [0, 255] -> [-1, 1]
-                elif x_max > 1.5:
-                    x = (x / 255.0) * 2.0 - 1.0
-                # else: assume already [-1, 1]
-            else:
-                raise ValueError(f"Unsupported image dtype for key '{k}': {x.dtype}")
-
-            out[k] = np.clip(x, -1.0, 1.0).astype(np.float32)
-
-        data["image"] = out
-        return data
-
-
-@dataclasses.dataclass(frozen=True)
 class SubsampleActions(DataTransformFn):
     stride: int
 

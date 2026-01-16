@@ -177,6 +177,7 @@ def main(
                     state = np.pad(state, (0, 32 - state.shape[-1]))
                 if action.shape[-1] < 32:
                     action = np.pad(action, (0, 32 - action.shape[-1]))
+
                 dataset.add_frame({
                     "image": agent_images[i],
                     "wrist_image": wrist_images[i],

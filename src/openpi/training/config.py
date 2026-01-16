@@ -117,7 +117,6 @@ class ModelTransformFactory(GroupFactory):
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
                         _transforms.ResizeImages(224, 224),
-                        _transforms.ConvertImagesToFloat32Minus1To1(),
                         _transforms.TokenizePrompt(
                             _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
                         ),
@@ -130,7 +129,6 @@ class ModelTransformFactory(GroupFactory):
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
                         _transforms.ResizeImages(224, 224),
-                        _transforms.ConvertImagesToFloat32Minus1To1(),
                         _transforms.TokenizePrompt(
                             _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
                             discrete_state_input=model_config.discrete_state_input,
@@ -151,7 +149,6 @@ class ModelTransformFactory(GroupFactory):
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
                         _transforms.ResizeImages(224, 224),
-                        _transforms.ConvertImagesToFloat32Minus1To1(),
                         _transforms.TokenizeFASTInputs(
                             tokenizer_cls(model_config.max_token_len, **tokenizer_kwargs),
                         ),
@@ -164,6 +161,54 @@ class ModelTransformFactory(GroupFactory):
                         )
                     ],
                 )
+
+
+@dataclasses.dataclass(frozen=True)
+class _ConvertImageDictUint8ToFloat32Minus1To1(_transforms.DataTransformFn):
+    """Config-local CPU conversion to avoid GPU uint8->float32 spikes.
+
+    This is intentionally not used globally; only Kinova self-collect config opts into it.
+    Expects `data["image"]` to be a dict of uint8 HWC images.
+    """
+
+    def __call__(self, data: dict) -> dict:
+        import numpy as np
+
+        if "image" not in data:
+            return data
+        out = {}
+        for k, v in data["image"].items():
+            x = np.asarray(v)
+            if x.dtype != np.uint8:
+                # If already float (e.g., custom pipeline), leave it unchanged.
+                out[k] = x
+                continue
+            out[k] = x.astype(np.float32) / 127.5 - 1.0
+        data["image"] = out
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
+class _KinovaModelTransformFactory(GroupFactory):
+    """Model transforms for Kinova self-collect only (keeps other configs unchanged)."""
+
+    default_prompt: str | None = None
+
+    def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
+        # Only intended for Pi0Config-based PI05 training.
+        assert isinstance(model_config, pi0_config.Pi0Config)
+        return _transforms.Group(
+            inputs=[
+                _transforms.InjectDefaultPrompt(self.default_prompt),
+                _transforms.ResizeImages(224, 224),  # runs on uint8 via PIL path
+                _ConvertImageDictUint8ToFloat32Minus1To1(),  # CPU conversion to [-1,1] float32
+                _transforms.TokenizePrompt(
+                    _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+                    discrete_state_input=model_config.discrete_state_input,
+                ),
+                _transforms.PadStatesAndActions(model_config.action_dim),
+            ],
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -688,9 +733,8 @@ _CONFIGS = [
         ),
         data=SimpleDataConfig(
             repo_id="kinova_gen3_dataset",
-            data_transforms=lambda model: _transforms.Group(
-                inputs=[libero_policy.LiberoInputs(model_type=ModelType.PI05)],
-            ),
+            data_transforms=lambda model: _transforms.Group(inputs=[libero_policy.LiberoInputs(model_type=ModelType.PI05)]),
+            model_transforms=_KinovaModelTransformFactory(),
             base_config=DataConfig(
                 repack_transforms=_transforms.Group(
                     inputs=[
