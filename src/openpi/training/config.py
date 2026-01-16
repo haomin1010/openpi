@@ -648,13 +648,12 @@ _CONFIGS = [
         name="pi05_kinova",
         model=pi0_config.Pi0Config(action_horizon=15, pi05=True),
         data=SimpleDataConfig(
-            assets=AssetsConfig(asset_id="droid"),
+            assets=AssetsConfig(asset_id="franka"),
             data_transforms=lambda model: _transforms.Group(
                 inputs=[droid_policy.DroidInputs(model_type=ModelType.PI05)],
                 outputs=[
                     # Convert delta actions to absolute positions for joints (first 7 dims),
                     # gripper (8th dim) remains unchanged.
-                    _transforms.AbsoluteActions(_transforms.make_bool_mask(7, -1)),
                     droid_policy.DroidOutputs(),
                 ],
             ),
