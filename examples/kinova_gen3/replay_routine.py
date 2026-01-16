@@ -37,6 +37,7 @@ import numpy as np
 from kinova_env import KinovaRobotEnv, ActionMode
 from trajectory_smoothing import TrajectorySmoother
 from velocity_controller import CartesianVelocityController, create_twist_command, create_stop_command
+from safety_monitor import SafetyMonitor
 
 # 设置日志
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
@@ -181,6 +182,7 @@ class TrajectoryReplayer:
         playback_speed: float = 1.0,
         start_step: int = 0,
         end_step: Optional[int] = None,
+        safety_monitor: Optional[SafetyMonitor] = None,
     ):
         """
         回放轨迹
@@ -248,6 +250,13 @@ class TrajectoryReplayer:
             time_diffs = np.ones(num_actions) / collection_frequency / playback_speed
         
         try:
+            # 安全检测：若超出安全区，软急停将直接停止回放
+            if safety_monitor is not None:
+                obs = self.env.get_observation()
+                if not safety_monitor.check_and_handle(self.env, obs['robot_state']['joint_positions']):
+                    logger.warning("当前状态已超出安全区，停止回放")
+                    return
+
             # 移动到起始位置
             # 先移动到轨迹的起始位置，确保从正确的位置开始回放
             logger.info("移动到起始位置...")
@@ -278,6 +287,16 @@ class TrajectoryReplayer:
                 # 构造动作数组（env 格式：0.0=张开，1.0=闭合）
                 action = np.concatenate([target_joint_pos, [target_gripper_pos_env]])
                 
+                # 安全检测：超出安全区时软急停忽略指令，硬急停触发急停
+                if safety_monitor is not None:
+                    obs = self.env.get_observation()
+                    if not safety_monitor.check_and_handle(self.env, obs['robot_state']['joint_positions']):
+                        if i < end_step - 1:
+                            wait_time = time_diffs[i - start_step]
+                            if wait_time > 0:
+                                time.sleep(wait_time)
+                        continue
+
                 # 执行动作（使用绝对位置模式）
                 self.env.step(action)
                 
@@ -329,6 +348,7 @@ class TrajectoryReplayer:
         start_step: int = 0,
         end_step: Optional[int] = None,
         smoothing_window_size: int = 5,
+        safety_monitor: Optional[SafetyMonitor] = None,
     ):
         """
         平滑轨迹回放（使用速度控制和平滑滤波）
@@ -379,6 +399,13 @@ class TrajectoryReplayer:
         control_dt = 1.0 / collection_frequency / playback_speed
         
         try:
+            # 安全检测：若超出安全区，软急停将直接停止回放
+            if safety_monitor is not None:
+                obs = self.env.get_observation()
+                if not safety_monitor.check_and_handle(self.env, obs['robot_state']['joint_positions']):
+                    logger.warning("当前状态已超出安全区，停止回放")
+                    return
+
             # 移动到起始位置（使用关节位置控制）
             logger.info("移动到起始位置...")
             start_joint_pos = joint_positions[start_step]
@@ -398,6 +425,17 @@ class TrajectoryReplayer:
             
             # 回放轨迹
             for i in range(start_step, end_step):
+                # 安全检测：超出安全区时软急停忽略指令，硬急停触发急停
+                if safety_monitor is not None:
+                    obs = self.env.get_observation()
+                    if not safety_monitor.check_and_handle(self.env, obs['robot_state']['joint_positions']):
+                        # 软急停（速度控制）：发送零速度，保证不越界
+                        stop_cmd = create_stop_command()
+                        if stop_cmd is not None:
+                            self.env._base.SendTwistCommand(stop_cmd)
+                        time.sleep(control_dt)
+                        continue
+
                 # 获取目标末端位姿
                 target_eef_pose = eef_poses[i]
                 target_gripper_pos_data = gripper_positions[i]  # 数据格式：0.0=闭合，1.0=张开
@@ -603,6 +641,9 @@ def main():
   
   # 指定回放速度和范围
   python replay_routine.py --playback-speed 0.5 --start-step 100 --end-step 500
+
+  # 启用安全检测（软急停）
+  python replay_routine.py --safety --safety-mode soft
         """
     )
     
@@ -682,6 +723,50 @@ def main():
         default=5,
         help='平滑窗口大小（用于轨迹平滑的点数，默认: 5）'
     )
+
+    # 安全检测参数
+    parser.add_argument(
+        '--safety',
+        action='store_true',
+        help='启用安全检测（基于 URDF + boundingbox）'
+    )
+    parser.add_argument(
+        '--safety-mode',
+        type=str,
+        default='soft',
+        choices=['soft', 'hard'],
+        help='安全模式：soft=软急停(忽略指令), hard=硬急停(触发急停)；默认 soft'
+    )
+    parser.add_argument(
+        '--safety-urdf',
+        type=str,
+        default=None,
+        help='URDF 文件路径（默认使用 kinova_gen3 目录下的 GEN3_URDF_V12_with_dampint.urdf）'
+    )
+    parser.add_argument(
+        '--safety-bbox',
+        type=str,
+        default=None,
+        help='boundingbox.txt 路径（默认使用 kinova_gen3 目录下的 boundingbox.txt）'
+    )
+    parser.add_argument(
+        '--safety-ignore-first-joint',
+        action='store_true',
+        default=True,
+        help='忽略第一个关节位置检测（默认启用，已废弃，建议使用 --safety-joints）'
+    )
+    parser.add_argument(
+        '--safety-check-first-joint',
+        dest='safety_ignore_first_joint',
+        action='store_false',
+        help='启用第一个关节位置检测（已废弃，建议使用 --safety-joints）'
+    )
+    parser.add_argument(
+        '--safety-joints',
+        type=str,
+        default=None,
+        help='要监督的关节编号，用空格分隔（1-7=关节1-7，8=末端位置）。例如: "2 3 4 5 6 7 8" 表示监督关节2-7和末端（默认: 2-8，即不监督关节1）'
+    )
     
     # 数据目录
     parser.add_argument(
@@ -731,6 +816,43 @@ def main():
         external_camera_serial=args.external_camera_serial,
         wrist_camera_serial=args.wrist_camera_serial,
     )
+
+    # 创建安全检测器（可选）
+    safety_monitor = None
+    if args.safety:
+        script_dir = Path(__file__).parent
+        urdf_path = Path(args.safety_urdf) if args.safety_urdf else script_dir / "GEN3_URDF_V12_with_dampint.urdf"
+        bbox_path = Path(args.safety_bbox) if args.safety_bbox else script_dir / "boundingbox.txt"
+        
+        # 解析 monitored_joints 参数
+        monitored_joints = None
+        if args.safety_joints:
+            try:
+                # 解析空格分隔的整数列表
+                monitored_joints = [int(x) for x in args.safety_joints.split()]
+                # 验证范围
+                if not all(1 <= j <= 8 for j in monitored_joints):
+                    logger.error("--safety-joints 中的值必须在 1-8 范围内（1-7=关节，8=末端位置）")
+                    sys.exit(1)
+                logger.info(f"监督的关节: {sorted(set(monitored_joints))}")
+            except ValueError as e:
+                logger.error(f"无法解析 --safety-joints 参数: {e}，请使用空格分隔的整数，例如: '2 3 4 5 6 7 8'")
+                sys.exit(1)
+        else:
+            # 如果没有指定 --safety-joints，使用旧的 ignore_joint_names 逻辑（向后兼容）
+            ignore_joint_names = ["Actuator1"] if args.safety_ignore_first_joint else []
+            # 如果忽略第一个关节，默认监督 2-8
+            if args.safety_ignore_first_joint:
+                monitored_joints = list(range(2, 9))  # 2, 3, 4, 5, 6, 7, 8
+            else:
+                monitored_joints = list(range(1, 9))  # 1, 2, 3, 4, 5, 6, 7, 8
+        
+        safety_monitor = SafetyMonitor(
+            urdf_path=urdf_path,
+            boundingbox_path=bbox_path,
+            mode=args.safety_mode,
+            monitored_joints=monitored_joints,
+        )
     
     try:
         # 加载轨迹数据
@@ -744,6 +866,7 @@ def main():
                 start_step=args.start_step,
                 end_step=args.end_step,
                 smoothing_window_size=args.smoothing_window_size,
+                safety_monitor=safety_monitor,
             )
         else:
             replayer.replay_trajectory(
@@ -751,6 +874,7 @@ def main():
                 playback_speed=args.playback_speed,
                 start_step=args.start_step,
                 end_step=args.end_step,
+                safety_monitor=safety_monitor,
             )
         
     except KeyboardInterrupt:

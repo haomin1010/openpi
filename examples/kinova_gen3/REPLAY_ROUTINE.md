@@ -160,7 +160,31 @@ python replay_routine.py \
     --no-smooth
 ```
 
-#### 示例 7：组合使用多个参数
+#### 示例 7：启用安全检测（软急停模式）
+
+```bash
+python replay_routine.py \
+    --safety \
+    --safety-mode soft
+```
+
+#### 示例 8：启用安全检测（硬急停模式）
+
+```bash
+python replay_routine.py \
+    --safety \
+    --safety-mode hard
+```
+
+#### 示例 9：指定监督的关节（监督关节2-7和末端）
+
+```bash
+python replay_routine.py \
+    --safety \
+    --safety-joints "2 3 4 5 6 7 8"
+```
+
+#### 示例 10：组合使用多个参数（包含安全检测）
 
 ```bash
 python replay_routine.py \
@@ -170,7 +194,10 @@ python replay_routine.py \
     --playback-speed 0.75 \
     --start-step 50 \
     --end-step 300 \
-    --smoothing-window-size 7
+    --smoothing-window-size 7 \
+    --safety \
+    --safety-mode soft \
+    --safety-joints "2 3 4 5 6 7 8"
 ```
 
 ## 📝 命令行参数
@@ -204,6 +231,24 @@ python replay_routine.py \
 | `--smooth` | `True` (默认) | 使用平滑回放（速度控制和平滑滤波） |
 | `--no-smooth` | - | 禁用平滑回放（使用原始位置控制模式） |
 | `--smoothing-window-size` | `5` | 平滑窗口大小（用于轨迹平滑的点数，仅平滑回放时有效） |
+
+### 安全检测参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--safety` | False | 启用安全检测（基于 URDF + boundingbox） |
+| `--safety-mode` | `soft` | 安全模式：<br>- `soft`: 软急停，超出安全区时忽略控制指令<br>- `hard`: 硬急停，超出安全区时触发急停并锁死机械臂 |
+| `--safety-urdf` | `脚本目录/GEN3_URDF_V12_with_dampint.urdf` | URDF 文件路径 |
+| `--safety-bbox` | `脚本目录/boundingbox.txt` | boundingbox.txt 文件路径 |
+| `--safety-joints` | `2-8` | 要监督的关节编号，用空格分隔<br>- `1-7`: 对应关节 Actuator1 到 Actuator7<br>- `8`: 末端执行器位置<br>- 默认值：`2-8`（监督关节2-7和末端，不监督关节1）<br>- 示例：`"2 3 4 8"` 表示监督关节2、3、4和末端 |
+| `--safety-ignore-first-joint` | True | 忽略第一个关节位置检测（已废弃，建议使用 `--safety-joints`） |
+| `--safety-check-first-joint` | - | 启用第一个关节位置检测（已废弃，建议使用 `--safety-joints "1 2 3 4 5 6 7 8"`） |
+
+**安全检测说明：**
+- 安全检测基于 URDF 正运动学计算各关节和末端在基座坐标系中的位置
+- 使用 `boundingbox.txt` 定义的安全区域进行检测
+- 默认监督关节 2-8（不监督关节 1，因为它通常固定不动）
+- 详细说明请参考 [安全检测文档](SAFETY_MONITOR.md)
 
 ### 其他参数
 
@@ -250,6 +295,8 @@ replay_trajectory()  →  时间间隔计算
    - 首次使用建议使用较慢的回放速度（`--playback-speed 0.5`）
    - 确保回放区域无障碍物
    - 准备随时按 `Ctrl+C` 中断回放
+   - **强烈建议启用安全检测**（`--safety`），特别是首次回放新轨迹时
+   - 安全检测可以防止机械臂超出安全区域，避免碰撞或损坏
 
 2. **数据格式**
    - 只能使用 `replay_data` 目录中的数据文件
@@ -291,6 +338,7 @@ replay_trajectory()  →  时间间隔计算
 ## 🔗 相关文档
 
 - [数据采集指南](DATA_COLLECTION.md)：了解如何采集轨迹数据
+- [安全检测指南](SAFETY_MONITOR.md)：了解如何使用安全检测功能
 - [推理脚本 README](README.md)：了解如何使用策略进行推理
 - [Kinova 机器人环境](kinova_env.py)：了解机器人环境的实现
 
