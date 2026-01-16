@@ -82,12 +82,13 @@ uv run examples/kinova_gen3/convert_to_lerobot.py --prompt "Grab the target obje
 当图像仍是 `uint8` 时，`Observation.from_dict` 会执行 `uint8 -> float32` 转换。  
 如果此时 batch 已经在 GPU 上，这个转换会在 GPU 上产生**额外的 float32 临时 buffer**（峰值显存≈原图像+转换后的图像+中间临时），在多视角/较大 batch 时很容易触发 OOM。
 
-### 3) 本项目的改动（方案一：把转换前移到 CPU）
-为避免在 GPU 上做 dtype 转换，本项目把 “`uint8` → `float32[-1,1]`” 前移到了数据 transforms（CPU 侧）：
-- 新增 transform：`src/openpi/transforms.py::ConvertImagesToFloat32Minus1To1`
-- 并在 `src/openpi/training/config.py::ModelTransformFactory` 中将其插入到 `ResizeImages` **之后**（仍在 CPU 上进行 resize），在 batch 搬到 GPU 之前完成 dtype/归一化转换
+### 3) 本项目的改动（仅影响 Kinova 自采配置）
+为避免在 GPU 上做 dtype 转换，本项目为 `pi05_kinova_selfcollect` 配置添加了特殊的图像转换逻辑（**仅影响该配置，不影响其他训练配置**）：
+- 在 `src/openpi/training/config.py` 中新增了 `_ConvertImageDictUint8ToFloat32Minus1To1` transform，用于在 CPU 侧将 `data["image"]` 字典中的 uint8 图像转换为 float32[-1,1]
+- 新增了 `_KinovaModelTransformFactory`，在 `ResizeImages(224,224)` **之后**插入上述 CPU 转换步骤，在 batch 搬到 GPU 之前完成 dtype/归一化转换
+- 仅在 `pi05_kinova_selfcollect` 配置中使用 `model_transforms=_KinovaModelTransformFactory()`，其他训练配置保持原样
 
-这样 GPU 侧拿到的图像已经是 `float32[-1,1]`，不会再触发 `Observation.from_dict` 的 GPU `astype` 峰值分配，从而规避该类 OOM。
+这样 GPU 侧拿到的图像已经是 `float32[-1,1]`，不会再触发 `Observation.from_dict` 的 GPU `astype` 峰值分配，从而规避该类 OOM。同时，由于改动是配置级别的，不会影响其他训练配置的正常运行。
 
 ---
 
