@@ -99,7 +99,7 @@ class Policy(BasePolicy):
         else:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
         print("--------------------------------")
-        print(outputs["actions"][0])
+        print(outputs["actions"][0][:8])
         outputs = self._output_transform(outputs)
         print(outputs["actions"][0])
         print("--------------------------------")
