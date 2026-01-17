@@ -43,6 +43,7 @@ class RealSenseCamera:
         width: int = 640,
         height: int = 480,
         fps: int = 30,
+        timeout_ms: int = 5000,
     ):
         """
         初始化 RealSense 相机。
@@ -52,11 +53,13 @@ class RealSenseCamera:
             width: 图像宽度
             height: 图像高度
             fps: 帧率
+            timeout_ms: wait_for_frames() 的超时时间（毫秒），默认 5000ms
         """
         self.serial_number = serial_number
         self.width = width
         self.height = height
         self.fps = fps
+        self.timeout_ms = int(timeout_ms)  # wait_for_frames() 需要 int 类型
 
         self._pipeline = rs.pipeline()
         self._config = rs.config()
@@ -81,7 +84,9 @@ class RealSenseCamera:
 
         # 等待自动曝光稳定
         for _ in range(30):
-            self._pipeline.wait_for_frames()
+            frames = self._pipeline.wait_for_frames(self.timeout_ms)
+            # 释放帧以清理内部缓冲区
+            del frames
 
     @property
     def device_serial(self) -> str:
@@ -95,14 +100,21 @@ class RealSenseCamera:
         Returns:
             np.ndarray: (H, W, 3) uint8 格式的 RGB 图像
         """
-        frames = self._pipeline.wait_for_frames()
+        frames = self._pipeline.wait_for_frames(self.timeout_ms)
         color_frame = frames.get_color_frame()
 
         if not color_frame:
+            # 释放 frames 对象
+            del frames
             raise RuntimeError("无法获取彩色图像帧")
 
-        # 转换为 numpy 数组
-        color_image = np.asanyarray(color_frame.get_data())
+        # 转换为 numpy 数组（numpy 数组是独立的拷贝，不依赖 Frame 对象）
+        color_image = np.asanyarray(color_frame.get_data()).copy()
+        
+        # 显式释放 Frame 对象引用，清理内部缓冲区
+        del color_frame
+        del frames
+        
         return color_image
 
     def close(self):
@@ -124,6 +136,7 @@ class DualRealSenseCamera:
         width: int = 640,
         height: int = 480,
         fps: int = 30,
+        timeout_ms: int = 5000,
     ):
         """
         初始化双相机系统。
@@ -134,6 +147,7 @@ class DualRealSenseCamera:
             width: 图像宽度
             height: 图像高度
             fps: 帧率
+            timeout_ms: wait_for_frames() 的超时时间（毫秒），默认 5000ms
 
         注意：
             如果两个序列号都为 None，会尝试自动连接前两个可用的相机。
@@ -173,10 +187,10 @@ class DualRealSenseCamera:
 
         # 初始化两个相机
         self._external_camera = RealSenseCamera(
-            serial_number=external_serial, width=width, height=height, fps=fps
+            serial_number=external_serial, width=width, height=height, fps=fps, timeout_ms=timeout_ms
         )
         self._wrist_camera = RealSenseCamera(
-            serial_number=wrist_serial, width=width, height=height, fps=fps
+            serial_number=wrist_serial, width=width, height=height, fps=fps, timeout_ms=timeout_ms
         )
 
         logger.info(

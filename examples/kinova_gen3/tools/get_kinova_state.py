@@ -7,7 +7,6 @@ Kinova Gen3 状态查询工具
 使用示例:
     python get_kinova_state.py
     python get_kinova_state.py --robot-ip 192.168.1.10
-    python get_kinova_state.py --detail #额外打印一个[7,3]的矩阵，代表每个关节的坐标
 """
 
 import sys

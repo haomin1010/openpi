@@ -114,6 +114,27 @@ class URDFKinematics:
             joint_positions: (N, 3) 按关节顺序（Actuator1..7）排列
             eef_position: (3,) 末端执行器位置
         """
+        joint_positions, T = self._forward_kinematics(joint_angles)
+        eef_position = T[:3, 3].copy()
+        return joint_positions, eef_position
+
+    def compute_joint_positions_and_pose(
+        self, joint_angles: Sequence[float]
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        计算各个关节位置与末端位姿（位置 + 旋转矩阵）。
+
+        Returns:
+            joint_positions: (N, 3) 按关节顺序（Actuator1..7）排列
+            eef_position: (3,) 末端执行器位置
+            eef_rotation: (3, 3) 末端执行器旋转矩阵
+        """
+        joint_positions, T = self._forward_kinematics(joint_angles)
+        eef_position = T[:3, 3].copy()
+        eef_rotation = T[:3, :3].copy()
+        return joint_positions, eef_position, eef_rotation
+
+    def _forward_kinematics(self, joint_angles: Sequence[float]) -> Tuple[np.ndarray, np.ndarray]:
         joint_angles = np.asarray(joint_angles, dtype=np.float64)
         if len(joint_angles) != len(self.actuated_joint_names):
             raise ValueError(
@@ -136,8 +157,7 @@ class URDFKinematics:
             else:
                 T = T_joint
 
-        eef_position = T[:3, 3].copy()
-        return np.asarray(joint_positions, dtype=np.float64), eef_position
+        return np.asarray(joint_positions, dtype=np.float64), T
 
 
 def _make_transform(xyz: np.ndarray, rpy: np.ndarray) -> np.ndarray:

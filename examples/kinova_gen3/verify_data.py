@@ -22,10 +22,11 @@ import sys
 import json
 import numpy as np
 from pathlib import Path
+from typing import Optional
 import cv2
 from datetime import datetime
 
-def find_latest_libero_npz(data_dir: Path) -> Path | None:
+def find_latest_libero_npz(data_dir: Path) -> Optional[Path]:
     """
     在 data_dir 下查找“最新 session/libero_format 目录中最新的 npz 文件”。
 

@@ -719,21 +719,21 @@ class LiberoDataCollector:
         try:
             # 定义移动步长
             pos_step = 0.02  # 位置移动步长（米）
-            rot_step = 1.0   # 旋转移动步长（度）
+            rot_step = np.deg2rad(1.0)  # 旋转移动步长（弧度）
             
             # 计算实际移动量
             direction = np.array(movement_direction)
             pos_delta = direction[0:3] * pos_step   # 位置增量 (x, y, z)
-            rot_delta = direction[3:6] * rot_step   # 旋转增量 (rx, ry, rz)
+            rot_delta = direction[3:6] * rot_step   # 旋转增量 (rx, ry, rz)，单位 rad/s
             
             # 创建 TwistCommand 消息
             twist = Base_pb2.TwistCommand()
             twist.twist.linear_x = float(pos_delta[0])   # X 方向线速度
             twist.twist.linear_y = float(pos_delta[1])   # Y 方向线速度
             twist.twist.linear_z = float(pos_delta[2])   # Z 方向线速度
-            twist.twist.angular_x = float(rot_delta[0])  # X 轴角速度
-            twist.twist.angular_y = float(rot_delta[1])  # Y 轴角速度
-            twist.twist.angular_z = float(rot_delta[2])  # Z 轴角速度
+            twist.twist.angular_x = float(rot_delta[0])  # X 轴角速度 (rad/s)
+            twist.twist.angular_y = float(rot_delta[1])  # Y 轴角速度 (rad/s)
+            twist.twist.angular_z = float(rot_delta[2])  # Z 轴角速度 (rad/s)
             twist.reference_frame = Base_pb2.CARTESIAN_REFERENCE_FRAME_BASE  # 基坐标系
             
             # 设置持续时间（旋转移动需要更长时间）

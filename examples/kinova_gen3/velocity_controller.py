@@ -10,7 +10,7 @@
 """
 
 import numpy as np
-from typing import Optional
+from typing import Optional, Tuple
 import logging
 
 # Kinova kortex API
@@ -66,7 +66,7 @@ class CartesianVelocityController:
         self,
         current_pose: np.ndarray,
         target_pose: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray]:
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """
         计算从当前位置到目标位置的速度命令
         

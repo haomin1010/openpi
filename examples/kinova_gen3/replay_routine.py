@@ -38,6 +38,7 @@ from kinova_env import KinovaRobotEnv, ActionMode
 from trajectory_smoothing import TrajectorySmoother
 from velocity_controller import CartesianVelocityController, create_twist_command, create_stop_command
 from safety_monitor import SafetyMonitor
+from urdf_kinematics import URDFKinematics
 
 # 设置日志
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
@@ -63,6 +64,7 @@ class TrajectoryReplayer:
         - timestamp: (N,) 时间戳数组（可选）
         - eef_pose: (N, 7) 末端执行器位姿（可选）
         - action: (N, 8) 动作数组（可选，delta 形式：actions[t] = states[t+1] - states[t]）
+        - states/actions: (N, 8) LIBERO 格式（states 为绝对关节角+夹爪，actions 为 delta）
     
     属性：
         robot_ip (str): Kinova 机械臂 IP 地址
@@ -117,6 +119,7 @@ class TrajectoryReplayer:
                 - 'steps': (N,) 步数数组（可选）
                 - 'eef_poses': (N, 7) 末端执行器位姿（可选）
                 - 'actions': (N, 8) 动作数组（可选，delta 形式：actions[t] = states[t+1] - states[t]）
+                - 'states': (N, 8) LIBERO 格式状态（可选）
         
         Raises:
             FileNotFoundError: 如果轨迹文件不存在
@@ -135,10 +138,19 @@ class TrajectoryReplayer:
         data = np.load(data_path, allow_pickle=True)
         
         # 提取轨迹数据（注意：np.load 返回的对象支持字典访问）
-        trajectory = {
-            'joint_positions': data['joint_positions'],  # (N, 7)
-            'gripper_positions': data['gripper_pos'],    # (N,)
-        }
+        trajectory = {}
+        if 'states' in data and 'actions' in data:
+            states = data['states']
+            actions = data['actions']
+            trajectory['states'] = states  # (N, 8)
+            trajectory['actions'] = actions  # (N, 8)
+            trajectory['joint_positions'] = states[:, :7]
+            trajectory['gripper_positions'] = states[:, 7]
+            trajectory['eef_poses'] = data['eef_pose'] if 'eef_pose' in data else None
+        else:
+            trajectory['joint_positions'] = data['joint_positions']  # (N, 7)
+            trajectory['gripper_positions'] = data['gripper_pos']    # (N,)
+            trajectory['eef_poses'] = data['eef_pose'] if 'eef_pose' in data else None
         
         # 可选字段
         if 'timestamp' in data:
@@ -150,11 +162,6 @@ class TrajectoryReplayer:
             trajectory['steps'] = data['step']
         else:
             trajectory['steps'] = None
-            
-        if 'eef_pose' in data:
-            trajectory['eef_poses'] = data['eef_pose']
-        else:
-            trajectory['eef_poses'] = None
             
         if 'action' in data:
             trajectory['actions'] = data['action']
@@ -296,6 +303,14 @@ class TrajectoryReplayer:
                             if wait_time > 0:
                                 time.sleep(wait_time)
                         continue
+
+                obs = self.env.get_observation()
+                actual_joint_pos = obs["robot_state"]["joint_positions"]
+                joint_err = target_joint_pos - actual_joint_pos
+                logger.info(
+                    "关节误差(rad): %s",
+                    np.array2string(joint_err, precision=3, separator=","),
+                )
                 
                 # 执行动作（使用绝对位置模式）
                 self.env.step(action)
@@ -340,6 +355,203 @@ class TrajectoryReplayer:
         # 组合位置和四元数
         eef_pose = np.concatenate([cartesian_position[:3], quat])
         return eef_pose
+
+    def replay_actions(
+        self,
+        trajectory: dict,
+        playback_speed: float = 1.0,
+        start_step: int = 0,
+        end_step: Optional[int] = None,
+        smoothing_window_size: int = 5,
+        safety_monitor: Optional[SafetyMonitor] = None,
+        urdf_path: Optional[Path] = None,
+        smooth: bool = True,
+        inner_loop: bool = False,
+    ):
+        """
+        使用 LIBERO 格式的 actions 进行轨迹回放（与 main.py 控制逻辑一致）。
+
+        流程:
+            1) 回到初始位置（states[0]）
+            2) 按 actions delta 序列执行
+
+        Args:
+            trajectory: 包含 states/actions 的轨迹数据
+            playback_speed: 回放速度倍数
+            start_step: 起始步数
+            end_step: 结束步数（默认到末尾）
+            smoothing_window_size: 平滑窗口大小
+            safety_monitor: 安全检测器
+            urdf_path: URDF 路径（用于正运动学）
+            smooth: 是否使用平滑速度控制
+        """
+        from scipy.spatial.transform import Rotation
+
+        states = trajectory.get('states')
+        actions = trajectory.get('actions')
+        if states is None or actions is None:
+            raise ValueError("轨迹数据中缺少 states/actions，无法使用 actions 回放")
+        if states.shape[1] != 8 or actions.shape[1] != 8:
+            raise ValueError(f"states/actions 维度应为 8，但收到 {states.shape}, {actions.shape}")
+
+        num_steps = len(actions)
+        end_step = end_step if end_step is not None else num_steps
+        if start_step < 0 or start_step >= num_steps:
+            raise ValueError(f"起始步数 {start_step} 超出范围 [0, {num_steps})")
+        if end_step <= start_step or end_step > num_steps:
+            raise ValueError(f"结束步数 {end_step} 无效")
+
+        collection_frequency = trajectory.get('collection_frequency', 30.0)
+        control_dt = 1.0 / collection_frequency / playback_speed
+
+        # 初始化平滑器和速度控制器
+        smoother = None
+        velocity_controller = None
+        kinematics = None
+        if smooth:
+            smoother = TrajectorySmoother(window_size=smoothing_window_size)
+            velocity_controller = CartesianVelocityController(
+                max_linear_velocity=0.05,
+                max_angular_velocity=1.0,
+                position_gain=2.0,
+                orientation_gain=2.0,
+            )
+            if urdf_path is None:
+                script_dir = Path(__file__).parent
+                urdf_path = script_dir / "GEN3_URDF_V12_with_dampint.urdf"
+            kinematics = URDFKinematics(urdf_path)
+
+        logger.info(f"开始 actions 回放: 步数 {start_step} 到 {end_step} (共 {end_step - start_step} 步)")
+        logger.info(f"回放速度: {playback_speed}x，采集频率: {collection_frequency} Hz\n")
+
+        # 回到初始位置（states[0]）
+        start_state = states[start_step]
+        start_joint_pos = start_state[:7]
+        start_gripper_data = start_state[7]  # 0=闭合, 1=张开（数据格式）
+        start_gripper_env = 1.0 if start_gripper_data < 0.5 else 0.0
+        start_action = np.concatenate([start_joint_pos, [start_gripper_env]])
+        self.env.step(start_action)
+        time.sleep(1.0)
+
+        # 初始化平滑窗口
+        if smooth:
+            curr_obs = self.env.get_observation()
+            cart_pos = curr_obs["robot_state"]["cartesian_position"]
+            current_quat = Rotation.from_euler("xyz", cart_pos[3:], degrees=False).as_quat()
+            current_pose = np.concatenate([cart_pos[:3], current_quat])
+            for _ in range(smoothing_window_size):
+                smoother.add_pose(current_pose)
+
+        current_state = start_state.copy()
+
+        pos_tol = 0.002  # m
+        ang_tol = np.deg2rad(2.0)  # rad
+        max_inner_iters = 20
+        inner_dt = min(0.03, control_dt / 2.0)
+
+        for i in range(start_step, end_step):
+            start_time = time.time()
+
+            # 安全检测
+            if safety_monitor is not None:
+                obs = self.env.get_observation()
+                if not safety_monitor.check_and_handle(self.env, obs['robot_state']['joint_positions']):
+                    if smooth and self.env._base is not None:
+                        stop_cmd = create_stop_command()
+                        if stop_cmd is not None:
+                            self.env._base.SendTwistCommand(stop_cmd)
+                    time.sleep(control_dt)
+                    continue
+
+            # 计算目标状态（delta actions）
+            action_delta = actions[i]
+            next_state = current_state + action_delta
+            # gripper 只允许 0/1
+            next_state[7] = float(np.clip(next_state[7], 0.0, 1.0))
+
+            target_joint_pos = next_state[:7]
+            target_gripper_data = next_state[7]
+            target_gripper_env = 1.0 if target_gripper_data < 0.5 else 0.0
+            obs = self.env.get_observation()
+            actual_joint_pos = obs["robot_state"]["joint_positions"]
+            joint_err = target_joint_pos - actual_joint_pos
+            logger.info(
+                "关节误差(rad): %s",
+                np.array2string(joint_err, precision=3, separator=","),
+            )
+
+            # 执行动作（平滑/速度控制 或 直接位置控制）
+            if smooth:
+                joint_xyz, target_eef_pos, target_eef_rot = (
+                    kinematics.compute_joint_positions_and_pose(target_joint_pos)
+                )
+                target_quat = Rotation.from_matrix(target_eef_rot).as_quat()
+                target_pose = np.concatenate([target_eef_pos, target_quat])
+
+                smoother.add_pose(target_pose)
+                smoothed_pose = smoother.get_smoothed_pose()
+                if smoothed_pose is None:
+                    smoothed_pose = target_pose
+
+                if inner_loop:
+                    for _ in range(max_inner_iters):
+                        obs = self.env.get_observation()
+                        cart_pos = obs["robot_state"]["cartesian_position"]
+                        current_quat = Rotation.from_euler("xyz", cart_pos[3:], degrees=False).as_quat()
+                        current_pose = np.concatenate([cart_pos[:3], current_quat])
+
+                        pos_err = np.linalg.norm(smoothed_pose[:3] - current_pose[:3])
+                        quat_err = Rotation.from_quat(smoothed_pose[3:]) * Rotation.from_quat(current_pose[3:]).inv()
+                        ang_err = quat_err.magnitude()
+                        if pos_err < pos_tol and ang_err < ang_tol:
+                            break
+
+                        if safety_monitor is not None:
+                            if not safety_monitor.check_and_handle(self.env, obs["robot_state"]["joint_positions"]):
+                                stop_cmd = create_stop_command()
+                                if stop_cmd is not None:
+                                    self.env._base.SendTwistCommand(stop_cmd)
+                                time.sleep(inner_dt)
+                                continue
+
+                        linear_vel, angular_vel = velocity_controller.compute_velocity(
+                            current_pose, smoothed_pose
+                        )
+                        twist_cmd = create_twist_command(
+                            linear_vel, angular_vel, duration_ms=int(inner_dt * 1000)
+                        )
+                        if twist_cmd is not None:
+                            self.env._base.SendTwistCommand(twist_cmd)
+                        time.sleep(inner_dt)
+                else:
+                    cart_pos = obs["robot_state"]["cartesian_position"]
+                    current_quat = Rotation.from_euler("xyz", cart_pos[3:], degrees=False).as_quat()
+                    current_pose = np.concatenate([cart_pos[:3], current_quat])
+
+                    linear_vel, angular_vel = velocity_controller.compute_velocity(
+                        current_pose, smoothed_pose
+                    )
+                    twist_cmd = create_twist_command(
+                        linear_vel, angular_vel, duration_ms=int(control_dt * 1000)
+                    )
+                    if twist_cmd is not None:
+                        self.env._base.SendTwistCommand(twist_cmd)
+
+                if abs(target_gripper_env - self.env._current_gripper_pos) > 0.1:
+                    self.env._control_gripper(target_gripper_env)
+            else:
+                action = np.concatenate([target_joint_pos, [target_gripper_env]])
+                self.env.step(action)
+
+            current_state = next_state
+
+            elapsed_time = time.time() - start_time
+            if elapsed_time < control_dt:
+                time.sleep(control_dt - elapsed_time)
+
+            if (i - start_step + 1) % 50 == 0:
+                progress = (i - start_step + 1) / (end_step - start_step) * 100
+                logger.info(f"回放进度: {progress:.1f}% ({i - start_step + 1}/{end_step - start_step})")
     
     def replay_trajectory_smooth(
         self,
@@ -349,6 +561,7 @@ class TrajectoryReplayer:
         end_step: Optional[int] = None,
         smoothing_window_size: int = 5,
         safety_monitor: Optional[SafetyMonitor] = None,
+        inner_loop: bool = False,
     ):
         """
         平滑轨迹回放（使用速度控制和平滑滤波）
@@ -366,6 +579,8 @@ class TrajectoryReplayer:
         Raises:
             ValueError: 如果轨迹数据无效或缺少末端位姿信息
         """
+        from scipy.spatial.transform import Rotation
+
         joint_positions = trajectory['joint_positions']
         gripper_positions = trajectory['gripper_positions']
         eef_poses = trajectory.get('eef_poses')
@@ -390,9 +605,9 @@ class TrajectoryReplayer:
         smoother = TrajectorySmoother(window_size=smoothing_window_size)
         velocity_controller = CartesianVelocityController(
             max_linear_velocity=0.05,  # 5 cm/s
-            max_angular_velocity=0.5,  # rad/s
+            max_angular_velocity=1.0,  # rad/s
             position_gain=2.0,
-            orientation_gain=1.0,
+            orientation_gain=2.0,
         )
         
         # 计算控制周期（使用原始采集频率）
@@ -424,6 +639,11 @@ class TrajectoryReplayer:
             logger.info("开始平滑回放...\n")
             
             # 回放轨迹
+            pos_tol = 0.002  # m
+            ang_tol = np.deg2rad(2.0)  # rad
+            max_inner_iters = 20
+            inner_dt = min(0.03, control_dt / 2.0)
+
             for i in range(start_step, end_step):
                 # 安全检测：超出安全区时软急停忽略指令，硬急停触发急停
                 if safety_monitor is not None:
@@ -441,6 +661,14 @@ class TrajectoryReplayer:
                 target_gripper_pos_data = gripper_positions[i]  # 数据格式：0.0=闭合，1.0=张开
                 # 转换为 env 格式：数据格式 0.0=闭合，1.0=张开 -> env 格式 0.0=张开，1.0=闭合
                 target_gripper_pos_env = 1.0 if target_gripper_pos_data < 0.5 else 0.0
+
+                obs = self.env.get_observation()
+                actual_joint_pos = obs["robot_state"]["joint_positions"]
+                joint_err = joint_positions[i] - actual_joint_pos
+                logger.info(
+                    "关节误差(rad): %s",
+                    np.array2string(joint_err, precision=3, separator=","),
+                )
                 
                 # 添加到平滑器
                 smoother.add_pose(target_eef_pose)
@@ -451,30 +679,62 @@ class TrajectoryReplayer:
                     # 窗口未满，使用原始目标位姿
                     smoothed_target_pose = target_eef_pose
                 
-                # 获取当前位置
-                current_eef_pose = self._get_current_eef_pose()
-                
-                # 计算速度命令
-                linear_velocity, angular_velocity = velocity_controller.compute_velocity(
-                    current_eef_pose,
-                    smoothed_target_pose
-                )
-                
-                # 创建并发送速度命令
-                twist_cmd = create_twist_command(
-                    linear_velocity,
-                    angular_velocity,
-                    duration_ms=int(control_dt * 1000)
-                )
-                if twist_cmd is not None:
-                    self.env._base.SendTwistCommand(twist_cmd)
+                if inner_loop:
+                    for _ in range(max_inner_iters):
+                        current_eef_pose = self._get_current_eef_pose()
+                        pos_err = np.linalg.norm(smoothed_target_pose[:3] - current_eef_pose[:3])
+                        quat_err = Rotation.from_quat(smoothed_target_pose[3:]) * Rotation.from_quat(current_eef_pose[3:]).inv()
+                        ang_err = quat_err.magnitude()
+                        if pos_err < pos_tol and ang_err < ang_tol:
+                            break
+
+                        if safety_monitor is not None:
+                            obs = self.env.get_observation()
+                            if not safety_monitor.check_and_handle(self.env, obs["robot_state"]["joint_positions"]):
+                                stop_cmd = create_stop_command()
+                                if stop_cmd is not None:
+                                    self.env._base.SendTwistCommand(stop_cmd)
+                                time.sleep(inner_dt)
+                                continue
+
+                        linear_velocity, angular_velocity = velocity_controller.compute_velocity(
+                            current_eef_pose,
+                            smoothed_target_pose
+                        )
+                        twist_cmd = create_twist_command(
+                            linear_velocity,
+                            angular_velocity,
+                            duration_ms=int(inner_dt * 1000)
+                        )
+                        if twist_cmd is not None:
+                            self.env._base.SendTwistCommand(twist_cmd)
+                        time.sleep(inner_dt)
+                else:
+                    # 获取当前位置
+                    current_eef_pose = self._get_current_eef_pose()
+                    
+                    # 计算速度命令
+                    linear_velocity, angular_velocity = velocity_controller.compute_velocity(
+                        current_eef_pose,
+                        smoothed_target_pose
+                    )
+                    
+                    # 创建并发送速度命令
+                    twist_cmd = create_twist_command(
+                        linear_velocity,
+                        angular_velocity,
+                        duration_ms=int(control_dt * 1000)
+                    )
+                    if twist_cmd is not None:
+                        self.env._base.SendTwistCommand(twist_cmd)
                 
                 # 控制夹爪（使用关节位置控制，env 格式）
                 if abs(target_gripper_pos_env - self.env._current_gripper_pos) > 0.1:
                     self.env._control_gripper(target_gripper_pos_env)
                 
                 # 等待控制周期
-                time.sleep(control_dt)
+                if not inner_loop:
+                    time.sleep(control_dt)
                 
                 # 显示进度（每 50 步显示一次）
                 if (i - start_step + 1) % 50 == 0:
@@ -723,6 +983,11 @@ def main():
         default=5,
         help='平滑窗口大小（用于轨迹平滑的点数，默认: 5）'
     )
+    parser.add_argument(
+        '--inner-loop',
+        action='store_true',
+        help='启用内环闭环跟踪（小循环迭代速度控制直到误差收敛）'
+    )
 
     # 安全检测参数
     parser.add_argument(
@@ -853,29 +1118,46 @@ def main():
             mode=args.safety_mode,
             monitored_joints=monitored_joints,
     )
+    else:
+        script_dir = Path(__file__).parent
+        urdf_path = Path(args.safety_urdf) if args.safety_urdf else script_dir / "GEN3_URDF_V12_with_dampint.urdf"
     
     try:
         # 加载轨迹数据
         trajectory = replayer.load_trajectory(trajectory_path)
         
-        # 执行轨迹回放（根据参数选择平滑或原始模式）
-        if args.smooth:
-            replayer.replay_trajectory_smooth(
+        # 执行轨迹回放（优先使用 LIBERO actions）
+        if trajectory.get("states") is not None and trajectory.get("actions") is not None:
+            replayer.replay_actions(
                 trajectory,
                 playback_speed=args.playback_speed,
                 start_step=args.start_step,
                 end_step=args.end_step,
                 smoothing_window_size=args.smoothing_window_size,
                 safety_monitor=safety_monitor,
+                urdf_path=urdf_path,
+                smooth=args.smooth,
+                inner_loop=args.inner_loop,
             )
         else:
-            replayer.replay_trajectory(
-                trajectory,
-                playback_speed=args.playback_speed,
-                start_step=args.start_step,
-                end_step=args.end_step,
-                safety_monitor=safety_monitor,
-            )
+            if args.smooth:
+                replayer.replay_trajectory_smooth(
+                    trajectory,
+                    playback_speed=args.playback_speed,
+                    start_step=args.start_step,
+                    end_step=args.end_step,
+                    smoothing_window_size=args.smoothing_window_size,
+                    safety_monitor=safety_monitor,
+                    inner_loop=args.inner_loop,
+                )
+            else:
+                replayer.replay_trajectory(
+                    trajectory,
+                    playback_speed=args.playback_speed,
+                    start_step=args.start_step,
+                    end_step=args.end_step,
+                    safety_monitor=safety_monitor,
+                )
         
     except KeyboardInterrupt:
         # 用户中断（Ctrl+C）

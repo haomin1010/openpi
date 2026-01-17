@@ -170,3 +170,4 @@ cython_debug/
 # Kinova Gen3 data collection
 examples/kinova_gen3/wheels/*.whl   
 examples/kinova_gen3/*error*.txt
+videos

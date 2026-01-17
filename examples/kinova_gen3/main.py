@@ -23,6 +23,7 @@ import faulthandler
 import os
 import signal
 import time
+from typing import Optional
 
 import numpy as np
 from openpi_client import image_tools
@@ -56,8 +57,8 @@ class Args:
     gripper_ip: str = "192.168.1.43"
     
     # RealSense D435i 相机序列号
-    external_camera_serial: str | None = None  # 外部相机（左侧视角）
-    wrist_camera_serial: str | None = None     # 腕部相机
+    external_camera_serial: Optional[str] = None  # 外部相机（左侧视角）
+    wrist_camera_serial: Optional[str] = None     # 腕部相机
 
     # =========================================================================
     # 策略服务器配置
@@ -95,9 +96,9 @@ class Args:
     # =========================================================================
     safety: bool = True
     safety_mode: str = "soft"
-    safety_urdf: str | None = None
-    safety_bbox: str | None = None
-    safety_joints: str | None = None
+    safety_urdf: Optional[str] = None
+    safety_bbox: Optional[str] = None
+    safety_joints: Optional[str] = None
 
 
 @contextlib.contextmanager
@@ -269,21 +270,31 @@ def main(args: Args):
                                 time.sleep(1 / CONTROL_FREQUENCY - elapsed_time)
                             continue
 
+                    # 打印执行前的 action
+                    joint_angles_str = ", ".join([f"{x:.4f}" for x in action[:7]])
+                    gripper_str = f"{action[-1]:.4f}"
+                    print(f"\n[t={t_step}] 执行 Action:")
+                    print(f"  关节角度: [{joint_angles_str}]")
+                    print(f"  夹爪位置: {gripper_str}")
+
                     # 执行动作（平滑/速度控制 或 直接位置控制）
                     if args.smooth:
                         # 计算目标末端位置（由关节角度通过 URDF 正运动学推导）
                         target_joint_pos = action[:7]
                         target_gripper_pos = action[-1]
 
-                        joint_xyz, target_eef_pos = kinematics.compute_joint_positions(target_joint_pos)
+                        joint_xyz, target_eef_pos, target_eef_rot = (
+                            kinematics.compute_joint_positions_and_pose(target_joint_pos)
+                        )
 
                         # 当前末端位姿（位置 + 四元数）
                         cart_pos = curr_obs["robot_state"]["cartesian_position"]  # [x,y,z,rx,ry,rz] (rad)
                         current_quat = Rotation.from_euler("xyz", cart_pos[3:], degrees=False).as_quat()
                         current_pose = np.concatenate([cart_pos[:3], current_quat])
 
-                        # 目标末端位姿：仅位置目标，姿态保持当前
-                        target_pose = np.concatenate([target_eef_pos, current_quat])
+                        # 目标末端位姿：位置与姿态都来自策略输出（经 URDF 正运动学推导）
+                        target_quat = Rotation.from_matrix(target_eef_rot).as_quat()
+                        target_pose = np.concatenate([target_eef_pos, target_quat])
 
                         # 平滑轨迹
                         smoother.add_pose(target_pose)
@@ -306,7 +317,17 @@ def main(args: Args):
                             env._control_gripper(target_gripper_pos)
                     else:
                         # 直接关节位置控制
-                        env.step(action)
+                    env.step(action)
+
+                    # 获取执行后的关节角度
+                    post_obs = env.get_observation()
+                    post_joint_positions = np.array(post_obs["robot_state"]["joint_positions"])
+                    post_gripper_position = post_obs["robot_state"]["gripper_position"]
+                    
+                    # 打印执行后的关节角度
+                    post_joint_angles_str = ", ".join([f"{x:.4f}" for x in post_joint_positions])
+                    print(f"  执行后关节角度: [{post_joint_angles_str}]")
+                    print(f"  执行后夹爪位置: {post_gripper_position:.4f}")
 
                     # 等待以匹配控制频率
                     elapsed_time = time.time() - start_time
