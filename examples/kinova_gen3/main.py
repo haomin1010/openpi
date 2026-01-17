@@ -30,8 +30,13 @@ from openpi_client import websocket_client_policy
 from PIL import Image
 import tqdm
 import tyro
+from scipy.spatial.transform import Rotation
 
 from kinova_env import KinovaRobotEnv, ActionMode
+from safety_monitor import SafetyMonitor
+from trajectory_smoothing import TrajectorySmoother
+from urdf_kinematics import URDFKinematics
+from velocity_controller import CartesianVelocityController, create_stop_command, create_twist_command
 
 faulthandler.enable()
 
@@ -75,6 +80,25 @@ class Args:
     # - velocity: 速度模式
     action_mode: str = "absolute"
 
+    # =========================================================================
+    # 平滑控制配置
+    # =========================================================================
+    smooth: bool = True
+    smoothing_window_size: int = 5
+    max_linear_velocity: float = 0.05
+    max_angular_velocity: float = 0.5
+    position_gain: float = 2.0
+    orientation_gain: float = 1.0
+
+    # =========================================================================
+    # 安全检测配置
+    # =========================================================================
+    safety: bool = True
+    safety_mode: str = "soft"
+    safety_urdf: str | None = None
+    safety_bbox: str | None = None
+    safety_joints: str | None = None
+
 
 @contextlib.contextmanager
 def prevent_keyboard_interrupt():
@@ -116,6 +140,48 @@ def main(args: Args):
         action_mode=args.action_mode,
     )
     print("机器人环境创建成功!")
+
+    # 初始化安全检测器（可选）
+    safety_monitor = None
+    if args.safety:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        urdf_path = args.safety_urdf if args.safety_urdf else os.path.join(script_dir, "GEN3_URDF_V12_with_dampint.urdf")
+        bbox_path = args.safety_bbox if args.safety_bbox else os.path.join(script_dir, "boundingbox.txt")
+
+        monitored_joints = None
+        if args.safety_joints:
+            try:
+                monitored_joints = [int(x) for x in args.safety_joints.split()]
+                if not all(1 <= j <= 8 for j in monitored_joints):
+                    raise ValueError("安全关节编号必须在 1-8 范围内（1-7=关节，8=末端）")
+            except ValueError as e:
+                print(f"安全关节参数解析失败: {e}")
+                return
+        else:
+            monitored_joints = list(range(2, 9))  # 默认监督关节 2-8
+
+        safety_monitor = SafetyMonitor(
+            urdf_path=urdf_path,
+            boundingbox_path=bbox_path,
+            mode=args.safety_mode,
+            monitored_joints=monitored_joints,
+        )
+
+    # 初始化平滑控制器（可选）
+    smoother = None
+    velocity_controller = None
+    kinematics = None
+    if args.smooth:
+        smoother = TrajectorySmoother(window_size=args.smoothing_window_size)
+        velocity_controller = CartesianVelocityController(
+            max_linear_velocity=args.max_linear_velocity,
+            max_angular_velocity=args.max_angular_velocity,
+            position_gain=args.position_gain,
+            orientation_gain=args.orientation_gain,
+        )
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        urdf_path = args.safety_urdf if args.safety_urdf else os.path.join(script_dir, "GEN3_URDF_V12_with_dampint.urdf")
+        kinematics = URDFKinematics(urdf_path)
 
     # 连接策略服务器
     print(f"连接策略服务器: {args.remote_host}:{args.remote_port}")
@@ -189,8 +255,58 @@ def main(args: Args):
                     else:
                         action = np.concatenate([action[:-1], np.zeros((1,))])
 
-                    # 执行动作
-                    env.step(action)
+                    # 安全检测（若启用）
+                    if safety_monitor is not None:
+                        if not safety_monitor.check_and_handle(env, obs_data["joint_position"]):
+                            # 软急停：速度控制发送零速度，位置控制跳过指令
+                            if args.smooth and env._base is not None:
+                                stop_cmd = create_stop_command()
+                                if stop_cmd is not None:
+                                    env._base.SendTwistCommand(stop_cmd)
+                            # 等待以匹配控制频率
+                            elapsed_time = time.time() - start_time
+                            if elapsed_time < 1 / CONTROL_FREQUENCY:
+                                time.sleep(1 / CONTROL_FREQUENCY - elapsed_time)
+                            continue
+
+                    # 执行动作（平滑/速度控制 或 直接位置控制）
+                    if args.smooth:
+                        # 计算目标末端位置（由关节角度通过 URDF 正运动学推导）
+                        target_joint_pos = action[:7]
+                        target_gripper_pos = action[-1]
+
+                        joint_xyz, target_eef_pos = kinematics.compute_joint_positions(target_joint_pos)
+
+                        # 当前末端位姿（位置 + 四元数）
+                        cart_pos = curr_obs["robot_state"]["cartesian_position"]  # [x,y,z,rx,ry,rz] (rad)
+                        current_quat = Rotation.from_euler("xyz", cart_pos[3:], degrees=False).as_quat()
+                        current_pose = np.concatenate([cart_pos[:3], current_quat])
+
+                        # 目标末端位姿：仅位置目标，姿态保持当前
+                        target_pose = np.concatenate([target_eef_pos, current_quat])
+
+                        # 平滑轨迹
+                        smoother.add_pose(target_pose)
+                        smoothed_pose = smoother.get_smoothed_pose()
+                        if smoothed_pose is None:
+                            smoothed_pose = target_pose
+
+                        # 计算速度命令并发送
+                        linear_vel, angular_vel = velocity_controller.compute_velocity(
+                            current_pose, smoothed_pose
+                        )
+                        twist_cmd = create_twist_command(
+                            linear_vel, angular_vel, duration_ms=int(1000 / CONTROL_FREQUENCY)
+                        )
+                        if twist_cmd is not None:
+                            env._base.SendTwistCommand(twist_cmd)
+
+                        # 控制夹爪（使用关节位置控制）
+                        if abs(target_gripper_pos - env._current_gripper_pos) > 0.1:
+                            env._control_gripper(target_gripper_pos)
+                    else:
+                        # 直接关节位置控制
+                        env.step(action)
 
                     # 等待以匹配控制频率
                     elapsed_time = time.time() - start_time

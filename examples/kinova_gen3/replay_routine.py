@@ -296,7 +296,7 @@ class TrajectoryReplayer:
                             if wait_time > 0:
                                 time.sleep(wait_time)
                         continue
-
+                
                 # 执行动作（使用绝对位置模式）
                 self.env.step(action)
                 
@@ -852,7 +852,7 @@ def main():
             boundingbox_path=bbox_path,
             mode=args.safety_mode,
             monitored_joints=monitored_joints,
-        )
+    )
     
     try:
         # 加载轨迹数据
