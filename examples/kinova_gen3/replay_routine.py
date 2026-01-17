@@ -414,7 +414,7 @@ class TrajectoryReplayer:
                 max_linear_velocity=0.05,
                 max_angular_velocity=1.0,
                 position_gain=2.0,
-                orientation_gain=2.0,
+                orientation_gain=5.0,
             )
             if urdf_path is None:
                 script_dir = Path(__file__).parent
@@ -607,7 +607,7 @@ class TrajectoryReplayer:
             max_linear_velocity=0.05,  # 5 cm/s
             max_angular_velocity=1.0,  # rad/s
             position_gain=2.0,
-            orientation_gain=2.0,
+            orientation_gain=5.0,
         )
         
         # 计算控制周期（使用原始采集频率）

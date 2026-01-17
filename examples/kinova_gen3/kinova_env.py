@@ -333,8 +333,9 @@ class KinovaRobotEnv:
         feedback = self._base_cyclic.RefreshFeedback()
 
         # 提取关节位置（转换为弧度）
+        # 将角度 wrap 到 [-180, 180] 度，然后转换为弧度
         joint_positions = np.array([
-            math.radians(actuator.position) 
+            math.radians((actuator.position + 180) % 360 - 180)
             for actuator in feedback.actuators
         ])
 
@@ -437,7 +438,7 @@ class KinovaRobotEnv:
         for i, pos in enumerate(target_positions):
             joint_angle = action.reach_joint_angles.joint_angles.joint_angles.add()
             joint_angle.joint_identifier = i
-            joint_angle.value = math.degrees(pos)  # kortex 使用角度
+            joint_angle.value = math.degrees(pos) % 360  # kortex 使用角度
 
         # 执行动作（非阻塞）
         self._base.ExecuteAction(action)
