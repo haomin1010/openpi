@@ -98,8 +98,12 @@ class Policy(BasePolicy):
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()), outputs)
         else:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
-
+        print("--------------------------------")
+        print(outputs["actions"][0])
         outputs = self._output_transform(outputs)
+        print(outputs["actions"][0])
+        print("--------------------------------")
+        print("")
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }
