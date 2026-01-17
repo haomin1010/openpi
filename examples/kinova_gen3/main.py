@@ -52,10 +52,10 @@ class Args:
     # =========================================================================
     # Kinova 机械臂
     robot_ip: str = "192.168.1.10"
-    
+
     # 夹爪（Arduino UDP）
     gripper_ip: str = "192.168.1.43"
-    
+
     # RealSense D435i 相机序列号
     external_camera_serial: Optional[str] = None  # 外部相机（左侧视角）
     wrist_camera_serial: Optional[str] = None     # 腕部相机
@@ -70,11 +70,11 @@ class Args:
     # 推理配置
     # =========================================================================
     max_timesteps: int = 600  # 最大时间步数
-    
+
     # 从预测的 action chunk 中执行多少个动作后再查询服务器
     # 8 通常是个好默认值（约 0.5 秒的动作执行）
     open_loop_horizon: int = 8
-    
+
     # 动作模式：
     # - absolute: 绝对位置模式（默认，与 pi05_kinova 配置兼容）
     # - delta: 增量模式，action 是相对当前位置的增量
@@ -241,7 +241,7 @@ def main(args: Args):
                         # 使用上下文管理器防止 Ctrl+C 中断服务器调用
                         with prevent_keyboard_interrupt():
                             pred_action_chunk = policy_client.infer(request_data)["actions"]
-                        
+
                         # 验证动作格式 [chunk_size, action_dim]
                         assert pred_action_chunk.shape[1] == 8, \
                             f"期望动作维度为 8，但收到 {pred_action_chunk.shape[1]}"
@@ -317,13 +317,13 @@ def main(args: Args):
                             env._control_gripper(target_gripper_pos)
                     else:
                         # 直接关节位置控制
-                    env.step(action)
+                        env.step(action)
 
                     # 获取执行后的关节角度
                     post_obs = env.get_observation()
                     post_joint_positions = np.array(post_obs["robot_state"]["joint_positions"])
                     post_gripper_position = post_obs["robot_state"]["gripper_position"]
-                    
+
                     # 打印执行后的关节角度
                     post_joint_angles_str = ", ".join([f"{x:.4f}" for x in post_joint_positions])
                     print(f"  执行后关节角度: [{post_joint_angles_str}]")
@@ -425,7 +425,7 @@ def _save_video(frames: list, timestamp: str):
 
         os.makedirs("videos", exist_ok=True)
         filename = f"videos/rollout_{timestamp}.mp4"
-        
+
         video_array = np.stack(frames)
         clip = ImageSequenceClip(list(video_array), fps=10)
         clip.write_videofile(filename, codec="libx264", verbose=False, logger=None)
