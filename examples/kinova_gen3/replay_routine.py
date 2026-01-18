@@ -1,30 +1,26 @@
 #!/usr/bin/env python3
 """
-Kinova 机械臂轨迹回放脚本
+Kinova Gen3 轨迹回放脚本（基于 libero_format 数据）
 
-从 data 目录读取轨迹数据并复现机器人动作。
+功能：
+1) 自动读取 data 目录中最新的 libero_format/*.npz
+2) 回放前回到初始位置（states[0]）
+3) 按 action chunk 执行（类似 pi05 部署逻辑）
+4) 关节角度控制 + 插值提升控制频率，实现更平滑轨迹
 
 使用示例：
-    # 回放最新的轨迹
+    # 回放最新的 libero_format 轨迹
     python replay_routine.py
     
-    # 回放指定的轨迹文件
-    python replay_routine.py --data-path data/General_manipulation_task_20260114_093000/replay_data/episode_001_replay_20260114_093159.npz
+    # 指定数据根目录
+    python replay_routine.py --data-dir /path/to/data
     
-    # 回放指定 session 的最新轨迹
-    python replay_routine.py --session data/General_manipulation_task_20260114_093000
-    
-    # 指定机器人 IP 和夹爪 IP
-    python replay_routine.py --robot-ip 192.168.1.10 --gripper-ip 192.168.1.43
+    # 指定 action chunk 和插值频率
+    python replay_routine.py --action-horizon 8 --interpolated-control-frequency-hz 120
 """
 
-import sys
 import os
-
-# 设置 protobuf 环境变量以兼容 kortex_api（必须在导入 kortex_api 之前）
-if "PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION" not in os.environ:
-    os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
-
+import sys
 import argparse
 import logging
 import time
@@ -32,1143 +28,428 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
+import json
+
+# 设置 protobuf 环境变量以兼容 kortex_api（必须在导入 kortex_api 之前）
+if "PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION" not in os.environ:
+    os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
 
 # 导入本地模块
 from kinova_env import KinovaRobotEnv, ActionMode
-from trajectory_smoothing import TrajectorySmoother
-from velocity_controller import CartesianVelocityController, create_twist_command, create_stop_command
-from safety_monitor import SafetyMonitor
-from urdf_kinematics import URDFKinematics
 
-# 设置日志
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 logger = logging.getLogger("ReplayRoutine")
 
 
-class TrajectoryReplayer:
+def _sleep_to_rate(start_time: float, hz: float) -> None:
+    """Sleep to maintain a target loop rate."""
+    if hz <= 0:
+        return
+    elapsed = time.time() - start_time
+    period = 1.0 / hz
+    if elapsed < period:
+        time.sleep(period - elapsed)
+
+
+def _interpolate_joint_targets(
+    start_joint_pos: np.ndarray, end_joint_pos: np.ndarray, steps: int
+) -> np.ndarray:
+    """Linearly interpolate joint targets between two poses.
+
+    Returns an array with shape (steps, 7). When steps == 1, it returns [end].
     """
-    轨迹回放器
-    
-    从保存的轨迹数据文件中读取机器人轨迹，并使用 KinovaRobotEnv
-    精确复现机器人的动作序列。
-    
-    主要功能：
-        - 加载轨迹数据（.npz 格式）
-        - 使用绝对位置模式精确回放轨迹
-        - 支持回放速度控制
-        - 支持指定回放范围
-    
-    数据格式要求：
-        - joint_positions: (N, 7) 关节位置数组（弧度）
-        - gripper_pos: (N,) 夹爪状态数组，0.0=闭合，1.0=张开（二值动作）
-        - timestamp: (N,) 时间戳数组（可选）
-        - eef_pose: (N, 7) 末端执行器位姿（可选）
-        - action: (N, 8) 动作数组（可选，delta 形式：actions[t] = states[t+1] - states[t]）
-        - states/actions: (N, 8) LIBERO 格式（states 为绝对关节角+夹爪，actions 为 delta）
-    
-    属性：
-        robot_ip (str): Kinova 机械臂 IP 地址
-        gripper_ip (str): Arduino 夹爪控制器 IP 地址
-        env (KinovaRobotEnv): 机器人环境实例（使用绝对位置模式）
+    steps = max(1, int(steps))
+    return np.linspace(start_joint_pos, end_joint_pos, steps + 1, endpoint=True)[1:]
+
+
+def _wait_until_reached(
+    env: KinovaRobotEnv,
+    target_joint_pos: np.ndarray,
+    *,
+    pos_tol: float,
+    timeout_s: float,
+    poll_dt: float = 0.01,
+) -> bool:
+    """Wait until joint positions are within tolerance or timeout."""
+    start_time = time.time()
+    while True:
+        obs = env.get_observation()
+        actual_joint_pos = obs["robot_state"]["joint_positions"]
+        err = np.linalg.norm(target_joint_pos - actual_joint_pos)
+        if err <= pos_tol:
+            return True
+        if time.time() - start_time >= timeout_s:
+            return False
+        time.sleep(poll_dt)
+
+
+def _append_replay_log(
+    log_entries: list,
+    *,
+    chunk_index: int,
+    action_index_in_chunk: int,
+    global_action_index: int,
+    interp_step: int,
+    interp_steps: int,
+    state: dict,
+    action: dict,
+    timestamp: float,
+) -> None:
+    log_entries.append(
+        {
+            "chunk_index": chunk_index,
+            "action_index_in_chunk": action_index_in_chunk,
+            "global_action_index": global_action_index,
+            "interp_step": interp_step,
+            "interp_steps": interp_steps,
+            "state": state,
+            "action": action,
+            "timestamp": timestamp,
+        }
+    )
+
+
+def _save_replay_log(log_entries: list, output_dir: Path, timestamp: str) -> None:
+    if not log_entries:
+        return
+    output_dir.mkdir(parents=True, exist_ok=True)
+    filename = output_dir / f"replay_log_{timestamp}.jsonl"
+    with open(filename, "w", encoding="utf-8") as f:
+        for entry in log_entries:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    logger.info("回放日志已保存: %s", filename)
+
+
+def _find_latest_libero_npz(data_root: Path) -> Optional[Path]:
+    libero_dirs = sorted([p for p in data_root.rglob("libero_format") if p.is_dir()])
+    npz_files: list[Path] = []
+    for libero_dir in libero_dirs:
+        npz_files.extend(sorted(libero_dir.glob("*_libero_*.npz")))
+    if not npz_files:
+        return None
+    npz_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return npz_files[0]
+
+
+def _load_libero_npz(path: Path) -> dict:
+    data = np.load(path, allow_pickle=True)
+    if "states" not in data or "actions" not in data:
+        raise ValueError("libero_format npz 缺少 states/actions 字段")
+
+    states = np.asarray(data["states"], dtype=np.float32)
+    actions = np.asarray(data["actions"], dtype=np.float32)
+
+    if states.ndim != 2 or states.shape[1] != 8:
+        raise ValueError(f"states 维度应为 (T, 8)，但收到 {states.shape}")
+    if actions.ndim != 2 or actions.shape[1] != 8:
+        raise ValueError(f"actions 维度应为 (T, 8)，但收到 {actions.shape}")
+    if len(actions) != len(states):
+        raise ValueError(f"actions 长度与 states 不一致: {len(actions)} vs {len(states)}")
+
+    collection_frequency = float(data["collection_frequency"]) if "collection_frequency" in data else 30.0
+    task = str(data["task"]) if "task" in data else "unknown"
+
+    return {
+        "states": states,
+        "actions": actions,
+        "collection_frequency": collection_frequency,
+        "task": task,
+    }
+
+
+def _data_gripper_to_env(gripper_data: float) -> float:
+    """Convert dataset gripper value to env value.
+
+    Dataset (libero_format) uses 0=闭合, 1=张开; env uses 0=张开, 1=闭合.
     """
-    
-    def __init__(
-        self,
-        robot_ip: str = "192.168.1.10",
-        gripper_ip: str = "192.168.1.43",
-        external_camera_serial: Optional[str] = None,
-        wrist_camera_serial: Optional[str] = None,
-    ):
-        """
-        初始化轨迹回放器。
-        
-        Args:
-            robot_ip: Kinova 机械臂 IP 地址
-            gripper_ip: Arduino 夹爪控制器 IP 地址
-            external_camera_serial: 外部相机序列号（可选）
-            wrist_camera_serial: 腕部相机序列号（可选）
-        """
-        self.robot_ip = robot_ip
-        self.gripper_ip = gripper_ip
-        self.external_camera_serial = external_camera_serial
-        self.wrist_camera_serial = wrist_camera_serial
-        
-        # 初始化机器人环境（使用绝对位置模式进行回放）
-        logger.info(f"连接机器人: {robot_ip}")
-        self.env = KinovaRobotEnv(
-            robot_ip=robot_ip,
-            gripper_ip=gripper_ip,
-            external_camera_serial=external_camera_serial,
-            wrist_camera_serial=wrist_camera_serial,
-            action_mode=ActionMode.ABSOLUTE,  # 使用绝对位置模式回放
-        )
-        logger.info("机器人环境初始化完成\n")
-        
-    def load_trajectory(self, data_path: Path) -> dict:
-        """
-        加载轨迹数据文件
-        
-        Args:
-            data_path: 轨迹数据文件路径（.npz 格式）
-            
-        Returns:
-            dict: 包含轨迹数据的字典，包含以下键：
-                - 'joint_positions': (N, 7) 关节位置数组（弧度）
-                - 'gripper_positions': (N,) 夹爪状态数组，0.0=闭合，1.0=张开（二值动作）
-                - 'timestamps': (N,) 时间戳数组（可选，如果文件中存在）
-                - 'steps': (N,) 步数数组（可选）
-                - 'eef_poses': (N, 7) 末端执行器位姿（可选）
-                - 'actions': (N, 8) 动作数组（可选，delta 形式：actions[t] = states[t+1] - states[t]）
-                - 'states': (N, 8) LIBERO 格式状态（可选）
-        
-        Raises:
-            FileNotFoundError: 如果轨迹文件不存在
-            ValueError: 如果轨迹数据为空
-        
-        注意：
-            - 必需字段：joint_positions, gripper_pos
-            - 可选字段：timestamp, step, eef_pose, action
-            - gripper_pos 是二值状态（0.0=闭合，1.0=张开），不是连续的归一化角度值
-            - action 是 delta 形式（actions[t] = states[t+1] - states[t]），回放时未使用（仅用于记录）
-        """
-        if not data_path.exists():
-            raise FileNotFoundError(f"轨迹文件不存在: {data_path}")
-        
-        logger.info(f"加载轨迹数据: {data_path.name}")
-        data = np.load(data_path, allow_pickle=True)
-        
-        # 提取轨迹数据（注意：np.load 返回的对象支持字典访问）
-        trajectory = {}
-        if 'states' in data and 'actions' in data:
-            states = data['states']
-            actions = data['actions']
-            trajectory['states'] = states  # (N, 8)
-            trajectory['actions'] = actions  # (N, 8)
-            trajectory['joint_positions'] = states[:, :7]
-            trajectory['gripper_positions'] = states[:, 7]
-            trajectory['eef_poses'] = data['eef_pose'] if 'eef_pose' in data else None
-        else:
-            trajectory['joint_positions'] = data['joint_positions']  # (N, 7)
-            trajectory['gripper_positions'] = data['gripper_pos']    # (N,)
-            trajectory['eef_poses'] = data['eef_pose'] if 'eef_pose' in data else None
-        
-        # 可选字段
-        if 'timestamp' in data:
-            trajectory['timestamps'] = data['timestamp']
-        else:
-            trajectory['timestamps'] = None
-            
-        if 'step' in data:
-            trajectory['steps'] = data['step']
-        else:
-            trajectory['steps'] = None
-            
-        if 'action' in data:
-            trajectory['actions'] = data['action']
-        else:
-            trajectory['actions'] = None
-        
-        # 采集频率（用于平滑回放）
-        if 'collection_frequency' in data:
-            trajectory['collection_frequency'] = float(data['collection_frequency'])
-        else:
-            # 旧数据可能不包含该字段；默认回退到 30Hz（与当前采集默认一致）
-            trajectory['collection_frequency'] = 30.0
-        
-        # 验证数据
-        num_steps = len(trajectory['joint_positions'])
-        if num_steps == 0:
-            raise ValueError("轨迹数据为空")
-        
-        logger.info(f"轨迹数据加载完成: {num_steps} 步，采集频率: {trajectory['collection_frequency']} Hz\n")
-        return trajectory
-    
-    def replay_trajectory(
-        self,
-        trajectory: dict,
-        playback_speed: float = 1.0,
-        start_step: int = 0,
-        end_step: Optional[int] = None,
-        safety_monitor: Optional[SafetyMonitor] = None,
-    ):
-        """
-        回放轨迹
-        
-        使用绝对位置模式精确复现机器人的动作序列。
-        
-        Args:
-            trajectory: 轨迹数据字典（由 load_trajectory 返回）
-            playback_speed: 回放速度倍数
-                - 1.0: 原始速度
-                - 2.0: 2倍速（更快）
-                - 0.5: 0.5倍速（更慢）
-            start_step: 起始步数（默认从第0步开始）
-            end_step: 结束步数（默认到轨迹末尾，即 None）
-        
-        Raises:
-            ValueError: 如果起始或结束步数无效
-        
-        执行流程：
-            1. 验证步数范围
-            2. 计算时间间隔（优先使用时间戳；否则使用数据中记录的 collection_frequency）
-            3. 移动到起始位置
-            4. 按时间间隔逐步执行轨迹
-            5. 显示回放进度（每 50 步）
-        
-        注意：
-            - 使用绝对位置模式（ActionMode.ABSOLUTE）确保精确复现
-            - 如果轨迹包含时间戳，使用原始时间间隔；否则使用固定频率
-            - 支持键盘中断（Ctrl+C）
-        """
-        joint_positions = trajectory['joint_positions']
-        gripper_positions = trajectory['gripper_positions']
-        timestamps = trajectory.get('timestamps')
-        
-        num_steps = len(joint_positions)
-        end_step = end_step if end_step is not None else num_steps
-        
-        if start_step < 0 or start_step >= num_steps:
-            raise ValueError(f"起始步数 {start_step} 超出范围 [0, {num_steps})")
-        if end_step <= start_step or end_step > num_steps:
-            raise ValueError(f"结束步数 {end_step} 无效")
-        
-        logger.info(f"开始回放轨迹: 步数 {start_step} 到 {end_step} (共 {end_step - start_step} 步)")
-        logger.info(f"回放速度: {playback_speed}x\n")
-        
-        # 计算时间间隔
-        # 时间间隔用于控制回放速度，确保按照原始采集频率或时间戳回放
-        num_actions = end_step - start_step
-        collection_frequency = trajectory.get('collection_frequency', 30.0)
-        if timestamps is not None and len(timestamps) > 1:
-            # 使用原始时间戳计算间隔（更精确）
-            # 注意：时间戳数组长度应该与 joint_positions 相同
-            if len(timestamps) != num_steps:
-                logger.warning(f"时间戳数组长度 ({len(timestamps)}) 与轨迹长度 ({num_steps}) 不匹配，使用固定频率")
-                # 时间戳不匹配，回退到固定频率
-                time_diffs = np.ones(num_actions) / collection_frequency / playback_speed
-            else:
-                # 计算相邻步骤之间的时间差
-                # np.diff 计算相邻元素差值，得到每步之间的时间间隔
-                time_diffs = np.diff(timestamps[start_step:end_step+1])
-                # 根据回放速度调整时间间隔
-                time_diffs = time_diffs / playback_speed
-        else:
-            # 如果没有时间戳，使用采集频率（优先使用数据中记录的 collection_frequency）
-            time_diffs = np.ones(num_actions) / collection_frequency / playback_speed
-        
-        try:
-            # 安全检测：若超出安全区，软急停将直接停止回放
-            if safety_monitor is not None:
-                obs = self.env.get_observation()
-                if not safety_monitor.check_and_handle(self.env, obs['robot_state']['joint_positions']):
-                    logger.warning("当前状态已超出安全区，停止回放")
-                    return
+    return 1.0 if gripper_data < 0.5 else 0.0
 
-            # 移动到起始位置
-            # 先移动到轨迹的起始位置，确保从正确的位置开始回放
-            logger.info("移动到起始位置...")
-            start_joint_pos = joint_positions[start_step]  # 起始关节位置（弧度）
-            start_gripper_pos_data = gripper_positions[start_step]  # 起始夹爪状态（数据格式：0.0=闭合，1.0=张开）
-            # 转换为 env 格式：数据格式 0.0=闭合，1.0=张开 -> env 格式 0.0=张开，1.0=闭合
-            start_gripper_pos_env = 1.0 if start_gripper_pos_data < 0.5 else 0.0
-            
-            # 构造动作：7个关节位置 + 1个夹爪状态（env 格式：0.0=张开，1.0=闭合）
-            # KinovaRobotEnv.step() 需要 (8,) 数组
-            start_action = np.concatenate([start_joint_pos, [start_gripper_pos_env]])
-            self.env.step(start_action)  # 使用绝对位置模式移动到起始位置
-            time.sleep(1.0)  # 等待机器人到达起始位置
-            
-            logger.info("开始回放...\n")
-            
-            # 回放轨迹
-            # 从 start_step 到 end_step-1，每次执行下一步的目标位置
-            for i in range(start_step, end_step):
-                # 获取目标位置
-                # 注意：我们在第 i 步时执行第 i+1 步的目标位置
-                # 这样可以确保从当前位置平滑移动到下一个位置
-                target_joint_pos = joint_positions[i + 1]  # 下一步的目标关节位置（弧度）
-                target_gripper_pos_data = gripper_positions[i + 1]  # 下一步的目标夹爪状态（数据格式：0.0=闭合，1.0=张开）
-                # 转换为 env 格式：数据格式 0.0=闭合，1.0=张开 -> env 格式 0.0=张开，1.0=闭合
-                target_gripper_pos_env = 1.0 if target_gripper_pos_data < 0.5 else 0.0
-                
-                # 构造动作数组（env 格式：0.0=张开，1.0=闭合）
-                action = np.concatenate([target_joint_pos, [target_gripper_pos_env]])
-                
-                # 安全检测：超出安全区时软急停忽略指令，硬急停触发急停
-                if safety_monitor is not None:
-                    obs = self.env.get_observation()
-                    if not safety_monitor.check_and_handle(self.env, obs['robot_state']['joint_positions']):
-                        if i < end_step - 1:
-                            wait_time = time_diffs[i - start_step]
-                            if wait_time > 0:
-                                time.sleep(wait_time)
-                        continue
 
-                obs = self.env.get_observation()
-                actual_joint_pos = obs["robot_state"]["joint_positions"]
-                joint_err = target_joint_pos - actual_joint_pos
-                logger.info(
-                    "关节误差(rad): %s",
-                    np.array2string(joint_err, precision=3, separator=","),
-                )
-                
-                # 执行动作（使用绝对位置模式）
-                self.env.step(action)
-                
-                # 等待到下一步
-                # 根据计算的时间间隔等待，确保回放速度正确
-                if i < end_step - 1:
-                    wait_time = time_diffs[i - start_step]
-                    if wait_time > 0:
-                        time.sleep(wait_time)
-                
-                # 显示进度（每 50 步显示一次）
-                if (i - start_step + 1) % 50 == 0:
-                    progress = (i - start_step + 1) / (end_step - start_step) * 100
-                    logger.info(f"回放进度: {progress:.1f}% ({i - start_step + 1}/{end_step - start_step})")
-            
-            logger.info("\n轨迹回放完成！\n")
-            
-        except KeyboardInterrupt:
-            logger.warning("\n回放被用户中断\n")
-        except Exception as e:
-            logger.error(f"回放过程中出错: {e}\n")
-            raise
-    
-    def _get_current_eef_pose(self) -> np.ndarray:
-        """
-        获取当前末端执行器位姿（从机器人反馈中获取）
-        
-        Returns:
-            末端执行器位姿数组 [x, y, z, qx, qy, qz, qw]（四元数格式）
-        """
-        from scipy.spatial.transform import Rotation
-        import math
-        
-        obs = self.env.get_observation()
-        cartesian_position = obs['robot_state']['cartesian_position']  # [x, y, z, rx, ry, rz] (欧拉角)
-        
-        # 转换为四元数
-        r = Rotation.from_euler('xyz', cartesian_position[3:], degrees=False)
-        quat = r.as_quat()  # [qx, qy, qz, qw]
-        
-        # 组合位置和四元数
-        eef_pose = np.concatenate([cartesian_position[:3], quat])
-        return eef_pose
-
-    def replay_actions(
-        self,
-        trajectory: dict,
-        playback_speed: float = 1.0,
-        start_step: int = 0,
-        end_step: Optional[int] = None,
-        smoothing_window_size: int = 5,
-        safety_monitor: Optional[SafetyMonitor] = None,
-        urdf_path: Optional[Path] = None,
-        smooth: bool = True,
-        inner_loop: bool = False,
-    ):
-        """
-        使用 LIBERO 格式的 actions 进行轨迹回放（与 main.py 控制逻辑一致）。
-
-        流程:
-            1) 回到初始位置（states[0]）
-            2) 按 actions delta 序列执行
-
-        Args:
-            trajectory: 包含 states/actions 的轨迹数据
-            playback_speed: 回放速度倍数
-            start_step: 起始步数
-            end_step: 结束步数（默认到末尾）
-            smoothing_window_size: 平滑窗口大小
-            safety_monitor: 安全检测器
-            urdf_path: URDF 路径（用于正运动学）
-            smooth: 是否使用平滑速度控制
-        """
-        from scipy.spatial.transform import Rotation
-
-        states = trajectory.get('states')
-        actions = trajectory.get('actions')
-        if states is None or actions is None:
-            raise ValueError("轨迹数据中缺少 states/actions，无法使用 actions 回放")
-        if states.shape[1] != 8 or actions.shape[1] != 8:
-            raise ValueError(f"states/actions 维度应为 8，但收到 {states.shape}, {actions.shape}")
-
-        num_steps = len(actions)
-        end_step = end_step if end_step is not None else num_steps
-        if start_step < 0 or start_step >= num_steps:
-            raise ValueError(f"起始步数 {start_step} 超出范围 [0, {num_steps})")
-        if end_step <= start_step or end_step > num_steps:
-            raise ValueError(f"结束步数 {end_step} 无效")
-
-        collection_frequency = trajectory.get('collection_frequency', 30.0)
-        control_dt = 1.0 / collection_frequency / playback_speed
-
-        # 初始化平滑器和速度控制器
-        smoother = None
-        velocity_controller = None
-        kinematics = None
-        if smooth:
-            smoother = TrajectorySmoother(window_size=smoothing_window_size)
-            velocity_controller = CartesianVelocityController(
-                max_linear_velocity=0.05,
-                max_angular_velocity=1.0,
-                position_gain=2.0,
-                orientation_gain=5.0,
-            )
-            if urdf_path is None:
-                script_dir = Path(__file__).parent
-                urdf_path = script_dir / "GEN3_URDF_V12_with_dampint.urdf"
-            kinematics = URDFKinematics(urdf_path)
-
-        logger.info(f"开始 actions 回放: 步数 {start_step} 到 {end_step} (共 {end_step - start_step} 步)")
-        logger.info(f"回放速度: {playback_speed}x，采集频率: {collection_frequency} Hz\n")
-
-        # 回到初始位置（states[0]）
-        start_state = states[start_step]
-        start_joint_pos = start_state[:7]
-        start_gripper_data = start_state[7]  # 0=闭合, 1=张开（数据格式）
-        start_gripper_env = 1.0 if start_gripper_data < 0.5 else 0.0
-        start_action = np.concatenate([start_joint_pos, [start_gripper_env]])
-        self.env.step(start_action)
+def _move_to_start(env: KinovaRobotEnv, start_state: np.ndarray) -> None:
+    start_state = np.asarray(start_state, dtype=np.float32)
+    if start_state.shape != (8,):
+        raise ValueError(f"start_state 维度应为 (8,), 但收到 {start_state.shape}")
+    start_action = np.concatenate(
+        [start_state[:7], [ _data_gripper_to_env(float(start_state[7])) ]]
+    )
+    env.step(start_action)
         time.sleep(1.0)
 
-        # 初始化平滑窗口
-        if smooth:
-            curr_obs = self.env.get_observation()
-            cart_pos = curr_obs["robot_state"]["cartesian_position"]
-            current_quat = Rotation.from_euler("xyz", cart_pos[3:], degrees=False).as_quat()
-            current_pose = np.concatenate([cart_pos[:3], current_quat])
-            for _ in range(smoothing_window_size):
-                smoother.add_pose(current_pose)
 
-        current_state = start_state.copy()
+def _execute_action_chunk(
+    env: KinovaRobotEnv,
+    chunk: np.ndarray,
+    *,
+    current_state: np.ndarray,
+    base_control_hz: float,
+    interpolated_control_frequency_hz: float,
+    last_commanded_joint_pos: Optional[np.ndarray],
+    log_entries: list,
+    chunk_index: int,
+    chunk_start_index: int,
+    inner_loop: bool,
+    inner_loop_pos_tol: float,
+    inner_loop_timeout_s: float,
+) -> tuple[np.ndarray, Optional[np.ndarray]]:
+    steps_per_action = max(1, int(interpolated_control_frequency_hz / base_control_hz))
+    actual_interp_hz = base_control_hz * steps_per_action
 
-        pos_tol = 0.002  # m
-        ang_tol = np.deg2rad(2.0)  # rad
-        max_inner_iters = 20
-        inner_dt = min(0.03, control_dt / 2.0)
-
-        for i in range(start_step, end_step):
-            start_time = time.time()
-
-            # 安全检测
-            if safety_monitor is not None:
-                obs = self.env.get_observation()
-                if not safety_monitor.check_and_handle(self.env, obs['robot_state']['joint_positions']):
-                    if smooth and self.env._base is not None:
-                        stop_cmd = create_stop_command()
-                        if stop_cmd is not None:
-                            self.env._base.SendTwistCommand(stop_cmd)
-                    time.sleep(control_dt)
-                    continue
-
-            # 计算目标状态（delta actions）
-            action_delta = actions[i]
+    for action_index_in_chunk, action_delta in enumerate(chunk):
+        global_action_index = chunk_start_index + action_index_in_chunk
             next_state = current_state + action_delta
-            # gripper 只允许 0/1
             next_state[7] = float(np.clip(next_state[7], 0.0, 1.0))
-
             target_joint_pos = next_state[:7]
-            target_gripper_data = next_state[7]
-            target_gripper_env = 1.0 if target_gripper_data < 0.5 else 0.0
-            obs = self.env.get_observation()
-            actual_joint_pos = obs["robot_state"]["joint_positions"]
-            joint_err = target_joint_pos - actual_joint_pos
-            logger.info(
-                "关节误差(rad): %s",
-                np.array2string(joint_err, precision=3, separator=","),
+        target_gripper_pos = _data_gripper_to_env(float(next_state[7]))
+
+        if steps_per_action == 1:
+            step_start = time.time()
+            action = np.concatenate([target_joint_pos, [target_gripper_pos]])
+            env.step(action)
+            _append_replay_log(
+                log_entries,
+                chunk_index=chunk_index,
+                action_index_in_chunk=action_index_in_chunk,
+                global_action_index=global_action_index,
+                interp_step=1,
+                interp_steps=1,
+                state={
+                    "current_state": current_state.tolist(),
+                    "next_state": next_state.tolist(),
+                },
+                action={
+                    "action_delta": action_delta.tolist(),
+                    "command_joint_pos": target_joint_pos.tolist(),
+                    "command_gripper_pos": float(target_gripper_pos),
+                },
+                timestamp=time.time(),
             )
-
-            # 执行动作（平滑/速度控制 或 直接位置控制）
-            if smooth:
-                joint_xyz, target_eef_pos, target_eef_rot = (
-                    kinematics.compute_joint_positions_and_pose(target_joint_pos)
+            logger.info(
+                "chunk=%d action=%d global=%d interp=%d/%d",
+                chunk_index,
+                action_index_in_chunk,
+                global_action_index,
+                1,
+                1,
+            )
+            if inner_loop:
+                _wait_until_reached(
+                    env,
+                    target_joint_pos,
+                    pos_tol=inner_loop_pos_tol,
+                    timeout_s=inner_loop_timeout_s,
                 )
-                target_quat = Rotation.from_matrix(target_eef_rot).as_quat()
-                target_pose = np.concatenate([target_eef_pos, target_quat])
-
-                smoother.add_pose(target_pose)
-                smoothed_pose = smoother.get_smoothed_pose()
-                if smoothed_pose is None:
-                    smoothed_pose = target_pose
-
-                if inner_loop:
-                    for _ in range(max_inner_iters):
-                        obs = self.env.get_observation()
-                        cart_pos = obs["robot_state"]["cartesian_position"]
-                        current_quat = Rotation.from_euler("xyz", cart_pos[3:], degrees=False).as_quat()
-                        current_pose = np.concatenate([cart_pos[:3], current_quat])
-
-                        pos_err = np.linalg.norm(smoothed_pose[:3] - current_pose[:3])
-                        quat_err = Rotation.from_quat(smoothed_pose[3:]) * Rotation.from_quat(current_pose[3:]).inv()
-                        ang_err = quat_err.magnitude()
-                        if pos_err < pos_tol and ang_err < ang_tol:
-                            break
-
-                        if safety_monitor is not None:
-                            if not safety_monitor.check_and_handle(self.env, obs["robot_state"]["joint_positions"]):
-                                stop_cmd = create_stop_command()
-                                if stop_cmd is not None:
-                                    self.env._base.SendTwistCommand(stop_cmd)
-                                time.sleep(inner_dt)
-                                continue
-
-                        linear_vel, angular_vel = velocity_controller.compute_velocity(
-                            current_pose, smoothed_pose
-                        )
-                        twist_cmd = create_twist_command(
-                            linear_vel, angular_vel, duration_ms=int(inner_dt * 1000)
-                        )
-                        if twist_cmd is not None:
-                            self.env._base.SendTwistCommand(twist_cmd)
-                        time.sleep(inner_dt)
-                else:
-                    cart_pos = obs["robot_state"]["cartesian_position"]
-                    current_quat = Rotation.from_euler("xyz", cart_pos[3:], degrees=False).as_quat()
-                    current_pose = np.concatenate([cart_pos[:3], current_quat])
-
-                    linear_vel, angular_vel = velocity_controller.compute_velocity(
-                        current_pose, smoothed_pose
-                    )
-                    twist_cmd = create_twist_command(
-                        linear_vel, angular_vel, duration_ms=int(control_dt * 1000)
-                    )
-                    if twist_cmd is not None:
-                        self.env._base.SendTwistCommand(twist_cmd)
-
-                if abs(target_gripper_env - self.env._current_gripper_pos) > 0.1:
-                    self.env._control_gripper(target_gripper_env)
             else:
-                action = np.concatenate([target_joint_pos, [target_gripper_env]])
-                self.env.step(action)
-
-            current_state = next_state
-
-            elapsed_time = time.time() - start_time
-            if elapsed_time < control_dt:
-                time.sleep(control_dt - elapsed_time)
-
-            if (i - start_step + 1) % 50 == 0:
-                progress = (i - start_step + 1) / (end_step - start_step) * 100
-                logger.info(f"回放进度: {progress:.1f}% ({i - start_step + 1}/{end_step - start_step})")
-    
-    def replay_trajectory_smooth(
-        self,
-        trajectory: dict,
-        playback_speed: float = 1.0,
-        start_step: int = 0,
-        end_step: Optional[int] = None,
-        smoothing_window_size: int = 5,
-        safety_monitor: Optional[SafetyMonitor] = None,
-        inner_loop: bool = False,
-    ):
-        """
-        平滑轨迹回放（使用速度控制和平滑滤波）
-        
-        使用笛卡尔空间速度控制和平滑滤波实现更平滑的轨迹回放。
-        可用于VLA策略输出动作的执行。
-        
-        Args:
-            trajectory: 轨迹数据字典（由 load_trajectory 返回）
-            playback_speed: 回放速度倍数（1.0 = 原始速度）
-            start_step: 起始步数（默认从第0步开始）
-            end_step: 结束步数（默认到轨迹末尾，即 None）
-            smoothing_window_size: 平滑窗口大小（用于轨迹平滑的点数）
-        
-        Raises:
-            ValueError: 如果轨迹数据无效或缺少末端位姿信息
-        """
-        from scipy.spatial.transform import Rotation
-
-        joint_positions = trajectory['joint_positions']
-        gripper_positions = trajectory['gripper_positions']
-        eef_poses = trajectory.get('eef_poses')
-        collection_frequency = trajectory.get('collection_frequency', 30.0)
-        
-        num_steps = len(joint_positions)
-        end_step = end_step if end_step is not None else num_steps
-        
-        if start_step < 0 or start_step >= num_steps:
-            raise ValueError(f"起始步数 {start_step} 超出范围 [0, {num_steps})")
-        if end_step <= start_step or end_step > num_steps:
-            raise ValueError(f"结束步数 {end_step} 无效")
-        
-        # 检查是否有末端位姿数据
-        if eef_poses is None:
-            raise ValueError("轨迹数据中缺少末端位姿信息（eef_pose），无法进行平滑回放")
-        
-        logger.info(f"开始平滑轨迹回放: 步数 {start_step} 到 {end_step} (共 {end_step - start_step} 步)")
-        logger.info(f"回放速度: {playback_speed}x，采集频率: {collection_frequency} Hz\n")
-        
-        # 初始化平滑器和速度控制器
-        smoother = TrajectorySmoother(window_size=smoothing_window_size)
-        velocity_controller = CartesianVelocityController(
-            max_linear_velocity=0.05,  # 5 cm/s
-            max_angular_velocity=1.0,  # rad/s
-            position_gain=2.0,
-            orientation_gain=5.0,
-        )
-        
-        # 计算控制周期（使用原始采集频率）
-        control_dt = 1.0 / collection_frequency / playback_speed
-        
-        try:
-            # 安全检测：若超出安全区，软急停将直接停止回放
-            if safety_monitor is not None:
-                obs = self.env.get_observation()
-                if not safety_monitor.check_and_handle(self.env, obs['robot_state']['joint_positions']):
-                    logger.warning("当前状态已超出安全区，停止回放")
-                    return
-
-            # 移动到起始位置（使用关节位置控制）
-            logger.info("移动到起始位置...")
-            start_joint_pos = joint_positions[start_step]
-            start_gripper_pos_data = gripper_positions[start_step]  # 数据格式：0.0=闭合，1.0=张开
-            # 转换为 env 格式：数据格式 0.0=闭合，1.0=张开 -> env 格式 0.0=张开，1.0=闭合
-            start_gripper_pos_env = 1.0 if start_gripper_pos_data < 0.5 else 0.0
-            start_action = np.concatenate([start_joint_pos, [start_gripper_pos_env]])
-            self.env.step(start_action)
-            time.sleep(1.0)  # 等待到达起始位置
-            
-            # 初始化平滑器（填充窗口）
-            current_eef_pose = self._get_current_eef_pose()
-            for _ in range(smoothing_window_size):
-                smoother.add_pose(current_eef_pose)
-            
-            logger.info("开始平滑回放...\n")
-            
-            # 回放轨迹
-            pos_tol = 0.002  # m
-            ang_tol = np.deg2rad(2.0)  # rad
-            max_inner_iters = 20
-            inner_dt = min(0.03, control_dt / 2.0)
-
-            for i in range(start_step, end_step):
-                # 安全检测：超出安全区时软急停忽略指令，硬急停触发急停
-                if safety_monitor is not None:
-                    obs = self.env.get_observation()
-                    if not safety_monitor.check_and_handle(self.env, obs['robot_state']['joint_positions']):
-                        # 软急停（速度控制）：发送零速度，保证不越界
-                        stop_cmd = create_stop_command()
-                        if stop_cmd is not None:
-                            self.env._base.SendTwistCommand(stop_cmd)
-                        time.sleep(control_dt)
-                        continue
-
-                # 获取目标末端位姿
-                target_eef_pose = eef_poses[i]
-                target_gripper_pos_data = gripper_positions[i]  # 数据格式：0.0=闭合，1.0=张开
-                # 转换为 env 格式：数据格式 0.0=闭合，1.0=张开 -> env 格式 0.0=张开，1.0=闭合
-                target_gripper_pos_env = 1.0 if target_gripper_pos_data < 0.5 else 0.0
-
-                obs = self.env.get_observation()
-                actual_joint_pos = obs["robot_state"]["joint_positions"]
-                joint_err = joint_positions[i] - actual_joint_pos
-                logger.info(
-                    "关节误差(rad): %s",
-                    np.array2string(joint_err, precision=3, separator=","),
-                )
-                
-                # 添加到平滑器
-                smoother.add_pose(target_eef_pose)
-                
-                # 获取平滑后的目标位姿
-                smoothed_target_pose = smoother.get_smoothed_pose()
-                if smoothed_target_pose is None:
-                    # 窗口未满，使用原始目标位姿
-                    smoothed_target_pose = target_eef_pose
-                
-                if inner_loop:
-                    for _ in range(max_inner_iters):
-                        current_eef_pose = self._get_current_eef_pose()
-                        pos_err = np.linalg.norm(smoothed_target_pose[:3] - current_eef_pose[:3])
-                        quat_err = Rotation.from_quat(smoothed_target_pose[3:]) * Rotation.from_quat(current_eef_pose[3:]).inv()
-                        ang_err = quat_err.magnitude()
-                        if pos_err < pos_tol and ang_err < ang_tol:
-                            break
-
-                        if safety_monitor is not None:
-                            obs = self.env.get_observation()
-                            if not safety_monitor.check_and_handle(self.env, obs["robot_state"]["joint_positions"]):
-                                stop_cmd = create_stop_command()
-                                if stop_cmd is not None:
-                                    self.env._base.SendTwistCommand(stop_cmd)
-                                time.sleep(inner_dt)
-                                continue
-
-                        linear_velocity, angular_velocity = velocity_controller.compute_velocity(
-                            current_eef_pose,
-                            smoothed_target_pose
-                        )
-                        twist_cmd = create_twist_command(
-                            linear_velocity,
-                            angular_velocity,
-                            duration_ms=int(inner_dt * 1000)
-                        )
-                        if twist_cmd is not None:
-                            self.env._base.SendTwistCommand(twist_cmd)
-                        time.sleep(inner_dt)
+                _sleep_to_rate(step_start, base_control_hz)
                 else:
-                    # 获取当前位置
-                    current_eef_pose = self._get_current_eef_pose()
-                    
-                    # 计算速度命令
-                    linear_velocity, angular_velocity = velocity_controller.compute_velocity(
-                        current_eef_pose,
-                        smoothed_target_pose
+            if last_commanded_joint_pos is None:
+                obs = env.get_observation()
+                start_joint_pos = obs["robot_state"]["joint_positions"]
+            else:
+                start_joint_pos = last_commanded_joint_pos
+
+            interpolated_joints = _interpolate_joint_targets(
+                start_joint_pos, target_joint_pos, steps_per_action
+            )
+            for interp_step_index, joint_target in enumerate(interpolated_joints, start=1):
+                sub_action = np.concatenate([joint_target, [target_gripper_pos]])
+                sub_step_start = time.time()
+                env.step(sub_action)
+                _append_replay_log(
+                    log_entries,
+                    chunk_index=chunk_index,
+                    action_index_in_chunk=action_index_in_chunk,
+                    global_action_index=global_action_index,
+                    interp_step=interp_step_index,
+                    interp_steps=len(interpolated_joints),
+                    state={
+                        "current_state": current_state.tolist(),
+                        "next_state": next_state.tolist(),
+                    },
+                    action={
+                        "action_delta": action_delta.tolist(),
+                        "command_joint_pos": joint_target.tolist(),
+                        "command_gripper_pos": float(target_gripper_pos),
+                    },
+                    timestamp=time.time(),
+                )
+                logger.info(
+                    "chunk=%d action=%d global=%d interp=%d/%d",
+                    chunk_index,
+                    action_index_in_chunk,
+                    global_action_index,
+                    interp_step_index,
+                    len(interpolated_joints),
+                )
+                if inner_loop:
+                    _wait_until_reached(
+                        env,
+                        joint_target,
+                        pos_tol=inner_loop_pos_tol,
+                        timeout_s=inner_loop_timeout_s,
                     )
-                    
-                    # 创建并发送速度命令
-                    twist_cmd = create_twist_command(
-                        linear_velocity,
-                        angular_velocity,
-                        duration_ms=int(control_dt * 1000)
-                    )
-                    if twist_cmd is not None:
-                        self.env._base.SendTwistCommand(twist_cmd)
-                
-                # 控制夹爪（使用关节位置控制，env 格式）
-                if abs(target_gripper_pos_env - self.env._current_gripper_pos) > 0.1:
-                    self.env._control_gripper(target_gripper_pos_env)
-                
-                # 等待控制周期
-                if not inner_loop:
-                    time.sleep(control_dt)
-                
-                # 显示进度（每 50 步显示一次）
-                if (i - start_step + 1) % 50 == 0:
-                    progress = (i - start_step + 1) / (end_step - start_step) * 100
-                    logger.info(f"回放进度: {progress:.1f}% ({i - start_step + 1}/{end_step - start_step})")
-            
-            # 停止机器人
-            stop_cmd = create_stop_command()
-            if stop_cmd is not None:
-                self.env._base.SendTwistCommand(stop_cmd)
-            
-            logger.info("\n平滑轨迹回放完成！\n")
-            
-        except KeyboardInterrupt:
-            logger.warning("\n回放被用户中断\n")
-            # 停止机器人
-            stop_cmd = create_stop_command()
-            if stop_cmd is not None:
-                self.env._base.SendTwistCommand(stop_cmd)
-        except Exception as e:
-            logger.error(f"回放过程中出错: {e}\n")
-            # 停止机器人
-            stop_cmd = create_stop_command()
-            if stop_cmd is not None:
-                self.env._base.SendTwistCommand(stop_cmd)
-            raise
-    
-    def close(self):
-        """
-        关闭机器人环境
-        
-        断开机器人连接、关闭相机等资源。
-        应在回放完成后调用此方法。
-        """
-        if hasattr(self, 'env'):
-            self.env.close()
-            logger.info("机器人环境已关闭\n")
+                else:
+                    _sleep_to_rate(sub_step_start, actual_interp_hz)
+
+        last_commanded_joint_pos = target_joint_pos
+        current_state = next_state
+
+    return current_state, last_commanded_joint_pos
 
 
-def find_latest_trajectory(data_dir: Path) -> Optional[Path]:
-    """
-    查找最新的轨迹文件
-    
-    在所有 session 目录的 replay_data 子目录中查找最新的轨迹文件。
-    
-    Args:
-        data_dir: 数据根目录路径（包含多个 session 目录）
-        
-    Returns:
-        Optional[Path]: 最新的轨迹文件路径，如果未找到则返回 None
-    
-    查找逻辑：
-        1. 遍历 data_dir 下的所有 session 目录
-        2. 在每个 session/replay_data 目录中查找轨迹文件
-        3. 按文件修改时间排序，返回最新的文件
-    
-    轨迹文件命名格式：
-        episode_{count:03d}_replay_{timestamp}.npz
-    """
-    if not data_dir.exists():
-        return None
-    
-    # 查找所有 replay_data 目录
-    replay_dirs = []
-    for session_dir in data_dir.iterdir():
-        if session_dir.is_dir():
-            replay_dir = session_dir / "replay_data"
-            if replay_dir.exists():
-                replay_dirs.append(replay_dir)
-    
-    if not replay_dirs:
-        return None
-    
-    # 查找所有轨迹文件
-    trajectory_files = []
-    for replay_dir in replay_dirs:
-        for file in replay_dir.glob("episode_*_replay_*.npz"):
-            trajectory_files.append(file)
-    
-    if not trajectory_files:
-        return None
-    
-    # 按修改时间排序，返回最新的
-    trajectory_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    return trajectory_files[0]
-
-
-def find_trajectory_in_session(session_dir: Path) -> Optional[Path]:
-    """
-    在指定 session 中查找最新的轨迹文件
-    
-    Args:
-        session_dir: session 目录路径（例如：data/General_manipulation_task_20260114_093000）
-        
-    Returns:
-        Optional[Path]: 最新的轨迹文件路径，如果未找到则返回 None
-    
-    查找逻辑：
-        1. 在 session_dir/replay_data 目录中查找轨迹文件
-        2. 按文件修改时间排序，返回最新的文件
-    
-    注意：
-        - 如果 replay_data 目录不存在，返回 None
-        - 如果目录中没有轨迹文件，返回 None
-    """
-    replay_dir = session_dir / "replay_data"
-    if not replay_dir.exists():
-        return None
-    
-    trajectory_files = list(replay_dir.glob("episode_*_replay_*.npz"))
-    if not trajectory_files:
-        return None
-    
-    # 按修改时间排序，返回最新的
-    trajectory_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    return trajectory_files[0]
-
-
-def main():
-    """
-    主函数：解析命令行参数并执行轨迹回放
-    
-    支持的命令行参数：
-        - 数据选择（互斥）：
-            --data-path: 指定轨迹文件路径
-            --session: 指定 session 目录（使用最新的轨迹）
-            （默认）：自动查找最新的轨迹文件
-        
-        - 机器人连接：
-            --robot-ip: Kinova 机械臂 IP（默认: 192.168.1.10）
-            --gripper-ip: 夹爪控制器 IP（默认: 192.168.1.43）
-            --external-camera-serial: 外部相机序列号（可选）
-            --wrist-camera-serial: 腕部相机序列号（可选）
-        
-        - 回放参数：
-            --playback-speed: 回放速度倍数（默认: 1.0）
-            --start-step: 起始步数（默认: 0）
-            --end-step: 结束步数（默认: 到轨迹末尾）
-        
-        - 其他：
-            --data-dir: 数据根目录（默认: 脚本目录/data）
-    
-    执行流程：
-        1. 解析命令行参数
-        2. 确定轨迹文件路径
-        3. 创建轨迹回放器
-        4. 加载轨迹数据
-        5. 执行回放
-        6. 清理资源
-    """
+def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Kinova 机械臂轨迹回放脚本",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-示例:
-  # 回放最新的轨迹
-  python replay_routine.py
-  
-  # 回放指定的轨迹文件
-  python replay_routine.py --data-path data/.../replay_data/episode_001_replay_xxx.npz
-  
-  # 回放指定 session 的最新轨迹
-  python replay_routine.py --session data/General_manipulation_task_20260114_093000
-  
-  # 指定回放速度和范围
-  python replay_routine.py --playback-speed 0.5 --start-step 100 --end-step 500
-
-  # 启用安全检测（软急停）
-  python replay_routine.py --safety --safety-mode soft
-        """
-    )
-    
-    # 数据选择参数
-    data_group = parser.add_mutually_exclusive_group()
-    data_group.add_argument(
-        '--data-path',
-        type=str,
-        help='轨迹数据文件路径（.npz 文件）'
-    )
-    data_group.add_argument(
-        '--session',
-        type=str,
-        help='session 目录路径（将使用该 session 中最新的轨迹）'
-    )
-    
-    # 机器人连接参数
-    parser.add_argument(
-        '--robot-ip',
-        type=str,
-        default='192.168.1.10',
-        help='Kinova 机械臂 IP 地址（默认: 192.168.1.10）'
+        description="Kinova Gen3 轨迹回放脚本（libero_format）"
     )
     parser.add_argument(
-        '--gripper-ip',
-        type=str,
-        default='192.168.1.43',
-        help='Arduino 夹爪控制器 IP 地址（默认: 192.168.1.43）'
-    )
-    parser.add_argument(
-        '--external-camera-serial',
+        "--data-dir",
         type=str,
         default=None,
-        help='外部相机序列号（可选）'
+        help="数据根目录（默认: examples/kinova_gen3/data）",
     )
     parser.add_argument(
-        '--wrist-camera-serial',
+        "--robot-ip",
+        type=str,
+        default="192.168.1.10",
+        help="Kinova 机械臂 IP 地址",
+    )
+    parser.add_argument(
+        "--gripper-ip",
+        type=str,
+        default="192.168.1.43",
+        help="夹爪控制器 IP 地址",
+    )
+    parser.add_argument(
+        "--external-camera-serial",
         type=str,
         default=None,
-        help='腕部相机序列号（可选）'
+        help="外部相机序列号（可选）",
     )
-    
-    # 回放参数
     parser.add_argument(
-        '--playback-speed',
+        "--wrist-camera-serial",
+        type=str,
+        default=None,
+        help="腕部相机序列号（可选）",
+    )
+    parser.add_argument(
+        "--action-horizon",
+        type=int,
+        default=8,
+        help="每次执行的 action chunk 大小（默认: 8）",
+    )
+    parser.add_argument(
+        "--playback-speed",
         type=float,
         default=1.0,
-        help='回放速度倍数（1.0 = 原始速度，2.0 = 2倍速，0.5 = 0.5倍速，默认: 1.0）'
+        help="回放速度倍数（1.0 = 原始速度）",
     )
     parser.add_argument(
-        '--start-step',
-        type=int,
-        default=0,
-        help='起始步数（默认: 0）'
+        "--interpolated-control-frequency-hz",
+        type=float,
+        default=120.0,
+        help="插值控制频率（默认: 120Hz）",
     )
     parser.add_argument(
-        '--end-step',
-        type=int,
-        default=None,
-        help='结束步数（默认: 到轨迹末尾）'
+        "--inner-loop",
+        action="store_true",
+        help="每次指令后等待机械臂到达目标位置再进入下一步",
     )
     parser.add_argument(
-        '--smooth',
-        action='store_true',
-        default=True,
-        help='使用平滑回放（速度控制和平滑滤波，默认启用）'
+        "--inner-loop-pos-tol",
+        type=float,
+        default=0.01,
+        help="内环等待的关节误差阈值（弧度，默认: 0.01）",
     )
     parser.add_argument(
-        '--no-smooth',
-        dest='smooth',
-        action='store_false',
-        help='禁用平滑回放（使用原始位置控制模式）'
-    )
-    parser.add_argument(
-        '--smoothing-window-size',
-        type=int,
-        default=5,
-        help='平滑窗口大小（用于轨迹平滑的点数，默认: 5）'
-    )
-    parser.add_argument(
-        '--inner-loop',
-        action='store_true',
-        help='启用内环闭环跟踪（小循环迭代速度控制直到误差收敛）'
-    )
-
-    # 安全检测参数
-    parser.add_argument(
-        '--safety',
-        action='store_true',
-        help='启用安全检测（基于 URDF + boundingbox）'
-    )
-    parser.add_argument(
-        '--safety-mode',
-        type=str,
-        default='soft',
-        choices=['soft', 'hard'],
-        help='安全模式：soft=软急停(忽略指令), hard=硬急停(触发急停)；默认 soft'
-    )
-    parser.add_argument(
-        '--safety-urdf',
-        type=str,
-        default=None,
-        help='URDF 文件路径（默认使用 kinova_gen3 目录下的 GEN3_URDF_V12_with_dampint.urdf）'
-    )
-    parser.add_argument(
-        '--safety-bbox',
-        type=str,
-        default=None,
-        help='boundingbox.txt 路径（默认使用 kinova_gen3 目录下的 boundingbox.txt）'
-    )
-    parser.add_argument(
-        '--safety-ignore-first-joint',
-        action='store_true',
-        default=True,
-        help='忽略第一个关节位置检测（默认启用，已废弃，建议使用 --safety-joints）'
-    )
-    parser.add_argument(
-        '--safety-check-first-joint',
-        dest='safety_ignore_first_joint',
-        action='store_false',
-        help='启用第一个关节位置检测（已废弃，建议使用 --safety-joints）'
-    )
-    parser.add_argument(
-        '--safety-joints',
-        type=str,
-        default=None,
-        help='要监督的关节编号，用空格分隔（1-7=关节1-7，8=末端位置）。例如: "2 3 4 5 6 7 8" 表示监督关节2-7和末端（默认: 2-8，即不监督关节1）'
-    )
-    
-    # 数据目录
-    parser.add_argument(
-        '--data-dir',
-        type=str,
-        default=None,
-        help='数据根目录（默认: 脚本所在目录的 data 子目录）'
+        "--inner-loop-timeout-s",
+        type=float,
+        default=2.0,
+        help="内环等待超时（秒，默认: 2.0）",
     )
     
     args = parser.parse_args()
     
-    # 确定数据目录
-    # 如果用户指定了数据目录，使用指定的；否则使用脚本目录下的 data 子目录
-    if args.data_dir:
-        data_dir = Path(args.data_dir)
-    else:
         script_dir = Path(__file__).parent
-        data_dir = script_dir / "data"
-    
-    # 确定轨迹文件路径
-    # 优先级：--data-path > --session > 默认（最新轨迹）
-    if args.data_path:
-        # 直接使用指定的轨迹文件路径
-        trajectory_path = Path(args.data_path)
-    elif args.session:
-        # 在指定的 session 目录中查找最新的轨迹文件
-        session_dir = Path(args.session)
-        trajectory_path = find_trajectory_in_session(session_dir)
-        if trajectory_path is None:
-            logger.error(f"在 session {session_dir} 中未找到轨迹文件\n")
+    data_root = Path(args.data_dir) if args.data_dir else script_dir / "data"
+
+    npz_path = _find_latest_libero_npz(data_root)
+    if npz_path is None:
+        logger.error(f"在 {data_root} 下未找到 libero_format/*.npz")
             sys.exit(1)
-    else:
-        # 默认：在所有 session 中查找最新的轨迹文件
-        trajectory_path = find_latest_trajectory(data_dir)
-        if trajectory_path is None:
-            logger.error(f"在 {data_dir} 中未找到轨迹文件\n")
-            logger.info("请使用 --data-path 或 --session 参数指定轨迹文件\n")
+
+    logger.info(f"使用数据文件: {npz_path}")
+    data = _load_libero_npz(npz_path)
+
+    states = data["states"]
+    actions = data["actions"]
+    collection_frequency = data["collection_frequency"]
+    task = data["task"]
+
+    base_control_hz = collection_frequency * args.playback_speed
+    if base_control_hz <= 0:
+        logger.error("无效的回放频率")
             sys.exit(1)
     
-    logger.info(f"使用轨迹文件: {trajectory_path}\n")
-    
-    # 创建轨迹回放器
-    # 初始化机器人环境（使用绝对位置模式）
-    replayer = TrajectoryReplayer(
+    logger.info(f"任务: {task}")
+    logger.info(
+        "采集频率: %.2f Hz, 回放速度: %.2fx, 基准控制频率: %.2f Hz",
+        collection_frequency,
+        args.playback_speed,
+        base_control_hz,
+    )
+    logger.info("action_horizon: %d, 插值频率: %.2f Hz", args.action_horizon, args.interpolated_control_frequency_hz)
+
+    env = KinovaRobotEnv(
         robot_ip=args.robot_ip,
         gripper_ip=args.gripper_ip,
         external_camera_serial=args.external_camera_serial,
         wrist_camera_serial=args.wrist_camera_serial,
+        action_mode=ActionMode.ABSOLUTE,
     )
 
-    # 创建安全检测器（可选）
-    safety_monitor = None
-    if args.safety:
-        script_dir = Path(__file__).parent
-        urdf_path = Path(args.safety_urdf) if args.safety_urdf else script_dir / "GEN3_URDF_V12_with_dampint.urdf"
-        bbox_path = Path(args.safety_bbox) if args.safety_bbox else script_dir / "boundingbox.txt"
-        
-        # 解析 monitored_joints 参数
-        monitored_joints = None
-        if args.safety_joints:
-            try:
-                # 解析空格分隔的整数列表
-                monitored_joints = [int(x) for x in args.safety_joints.split()]
-                # 验证范围
-                if not all(1 <= j <= 8 for j in monitored_joints):
-                    logger.error("--safety-joints 中的值必须在 1-8 范围内（1-7=关节，8=末端位置）")
-                    sys.exit(1)
-                logger.info(f"监督的关节: {sorted(set(monitored_joints))}")
-            except ValueError as e:
-                logger.error(f"无法解析 --safety-joints 参数: {e}，请使用空格分隔的整数，例如: '2 3 4 5 6 7 8'")
-                sys.exit(1)
-        else:
-            # 如果没有指定 --safety-joints，使用旧的 ignore_joint_names 逻辑（向后兼容）
-            ignore_joint_names = ["Actuator1"] if args.safety_ignore_first_joint else []
-            # 如果忽略第一个关节，默认监督 2-8
-            if args.safety_ignore_first_joint:
-                monitored_joints = list(range(2, 9))  # 2, 3, 4, 5, 6, 7, 8
-            else:
-                monitored_joints = list(range(1, 9))  # 1, 2, 3, 4, 5, 6, 7, 8
-        
-        safety_monitor = SafetyMonitor(
-            urdf_path=urdf_path,
-            boundingbox_path=bbox_path,
-            mode=args.safety_mode,
-            monitored_joints=monitored_joints,
-    )
-    else:
-        script_dir = Path(__file__).parent
-        urdf_path = Path(args.safety_urdf) if args.safety_urdf else script_dir / "GEN3_URDF_V12_with_dampint.urdf"
-    
     try:
-        # 加载轨迹数据
-        trajectory = replayer.load_trajectory(trajectory_path)
-        
-        # 执行轨迹回放（优先使用 LIBERO actions）
-        if trajectory.get("states") is not None and trajectory.get("actions") is not None:
-            replayer.replay_actions(
-                trajectory,
-                playback_speed=args.playback_speed,
-                start_step=args.start_step,
-                end_step=args.end_step,
-                smoothing_window_size=args.smoothing_window_size,
-                safety_monitor=safety_monitor,
-                urdf_path=urdf_path,
-                smooth=args.smooth,
+        # 清除可能存在的急停/故障状态，避免指令被忽略
+        try:
+            env.clear_estop()
+            logger.info("已清除急停/故障状态")
+        except Exception as e:
+            logger.warning("清除急停/故障状态失败: %s", e)
+
+        logger.info("移动到初始位置...")
+        _move_to_start(env, states[0])
+        logger.info("开始回放...\n")
+
+        replay_log_entries = []
+        log_timestamp = time.strftime("%Y_%m_%d_%H-%M-%S")
+        last_commanded_joint_pos = None
+        current_state = states[0].copy()
+        num_actions = len(actions)
+        for chunk_index, chunk_start in enumerate(range(0, num_actions, args.action_horizon)):
+            chunk_end = min(chunk_start + args.action_horizon, num_actions)
+            chunk = actions[chunk_start:chunk_end]
+            current_state, last_commanded_joint_pos = _execute_action_chunk(
+                env,
+                chunk,
+                current_state=current_state,
+                base_control_hz=base_control_hz,
+                interpolated_control_frequency_hz=args.interpolated_control_frequency_hz,
+                last_commanded_joint_pos=last_commanded_joint_pos,
+                log_entries=replay_log_entries,
+                chunk_index=chunk_index,
+                chunk_start_index=chunk_start,
                 inner_loop=args.inner_loop,
-            )
-        else:
-            if args.smooth:
-                replayer.replay_trajectory_smooth(
-                    trajectory,
-                    playback_speed=args.playback_speed,
-                    start_step=args.start_step,
-                    end_step=args.end_step,
-                    smoothing_window_size=args.smoothing_window_size,
-                    safety_monitor=safety_monitor,
-                    inner_loop=args.inner_loop,
+                inner_loop_pos_tol=args.inner_loop_pos_tol,
+                inner_loop_timeout_s=args.inner_loop_timeout_s,
                 )
-            else:
-                replayer.replay_trajectory(
-                    trajectory,
-                    playback_speed=args.playback_speed,
-                    start_step=args.start_step,
-                    end_step=args.end_step,
-                    safety_monitor=safety_monitor,
-                )
-        
+
+        logger.info("\n轨迹回放完成！")
+        _save_replay_log(replay_log_entries, npz_path.parent, log_timestamp)
     except KeyboardInterrupt:
-        # 用户中断（Ctrl+C）
-        logger.warning("\n程序被用户中断\n")
+        logger.warning("\n回放被用户中断\n")
     except Exception as e:
-        # 其他异常
-        logger.error(f"回放失败: {e}\n")
-        sys.exit(1)
+        logger.error(f"回放失败: {e}")
+        raise
     finally:
-        # 确保清理资源（断开机器人连接、关闭相机等）
-        replayer.close()
+        env.close()
 
 
 if __name__ == "__main__":

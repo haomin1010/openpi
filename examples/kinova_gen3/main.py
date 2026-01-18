@@ -20,6 +20,7 @@ import contextlib
 import dataclasses
 import datetime
 import faulthandler
+import json
 import os
 import signal
 import time
@@ -41,8 +42,89 @@ from velocity_controller import CartesianVelocityController, create_stop_command
 
 faulthandler.enable()
 
-# 控制频率
+# 动作执行频率（每个策略动作的执行周期）
 CONTROL_FREQUENCY = 30  # Hz
+
+
+def _sleep_to_rate(start_time: float, hz: float) -> None:
+    """Sleep to maintain a target loop rate."""
+    if hz <= 0:
+        return
+    elapsed = time.time() - start_time
+    period = 1.0 / hz
+    if elapsed < period:
+        time.sleep(period - elapsed)
+
+
+def _interpolate_joint_targets(
+    start_joint_pos: np.ndarray, end_joint_pos: np.ndarray, steps: int
+) -> np.ndarray:
+    """Linearly interpolate joint targets between two poses.
+
+    Returns an array with shape (steps, 7). When steps == 1, it returns [end].
+    """
+    steps = max(1, int(steps))
+    return np.linspace(start_joint_pos, end_joint_pos, steps + 1, endpoint=True)[1:]
+
+
+def _wait_until_reached(
+    env: KinovaRobotEnv,
+    target_joint_pos: np.ndarray,
+    *,
+    pos_tol: float,
+    timeout_s: float,
+    poll_dt: float = 0.01,
+) -> bool:
+    """Wait until joint positions are within tolerance or timeout."""
+    start_time = time.time()
+    while True:
+        obs = env.get_observation()
+        actual_joint_pos = obs["robot_state"]["joint_positions"]
+        err = np.linalg.norm(target_joint_pos - actual_joint_pos)
+        if err <= pos_tol:
+            return True
+        if time.time() - start_time >= timeout_s:
+            return False
+        time.sleep(poll_dt)
+
+
+def _append_control_log(
+    log_entries: list,
+    *,
+    t_step: int,
+    chunk_index: int,
+    action_index: int,
+    interp_step: int,
+    interp_steps: int,
+    state: dict,
+    action: dict,
+    mode: str,
+    timestamp: float,
+) -> None:
+    log_entries.append(
+        {
+            "t_step": t_step,
+            "chunk_index": chunk_index,
+            "action_index": action_index,
+            "interp_step": interp_step,
+            "interp_steps": interp_steps,
+            "state": state,
+            "action": action,
+            "mode": mode,
+            "timestamp": timestamp,
+        }
+    )
+
+
+def _save_control_log(log_entries: list, timestamp: str) -> None:
+    if not log_entries:
+        return
+    os.makedirs("logs", exist_ok=True)
+    filename = f"logs/control_log_{timestamp}.jsonl"
+    with open(filename, "w", encoding="utf-8") as f:
+        for entry in log_entries:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    print(f"控制日志已保存: {filename}")
 
 
 @dataclasses.dataclass
@@ -84,12 +166,21 @@ class Args:
     # =========================================================================
     # 平滑控制配置
     # =========================================================================
-    smooth: bool = True
+    smooth: bool = False
     smoothing_window_size: int = 5
     max_linear_velocity: float = 0.05
     max_angular_velocity: float = 0.5
     position_gain: float = 2.0
     orientation_gain: float = 1.0
+
+    # =========================================================================
+    # 无平滑模式下的插值控制配置
+    # =========================================================================
+    # 在 --no-smooth 模式下，将动作插值到更高频率以获得更平滑的控制
+    interpolated_control_frequency_hz: int = 120
+    no_smooth_inner_loop: bool = True
+    no_smooth_inner_loop_pos_tol: float = 0.01
+    no_smooth_inner_loop_timeout_s: float = 2.0
 
     # =========================================================================
     # 安全检测配置
@@ -192,6 +283,7 @@ def main(args: Args):
     print("策略服务器连接成功!")
 
     # 用于保存视频的列表
+    last_commanded_joint_pos = None
     try:
         while True:
             instruction = input("\n输入任务指令 (或 'q' 退出): ")
@@ -201,6 +293,8 @@ def main(args: Args):
             # Rollout 参数
             actions_from_chunk_completed = 0
             pred_action_chunk = None
+            chunk_index = -1
+            control_log_entries = []
 
             # 准备保存视频
             timestamp = datetime.datetime.now().strftime("%Y_%m_%d_%H-%M-%S")
@@ -224,6 +318,7 @@ def main(args: Args):
                     # 如果需要，查询策略服务器获取新的动作 chunk
                     if actions_from_chunk_completed == 0 or actions_from_chunk_completed >= args.open_loop_horizon:
                         actions_from_chunk_completed = 0
+                        chunk_index += 1
 
                         # 准备请求数据（图像需要 resize 到 224x224）
                         request_data = {
@@ -247,7 +342,8 @@ def main(args: Args):
                             f"期望动作维度为 8，但收到 {pred_action_chunk.shape[1]}"
 
                     # 从 chunk 中选择当前要执行的动作
-                    action = pred_action_chunk[actions_from_chunk_completed]
+                    action_index_in_chunk = actions_from_chunk_completed
+                    action = pred_action_chunk[action_index_in_chunk]
                     actions_from_chunk_completed += 1
 
                     # 二值化夹爪动作
@@ -315,9 +411,119 @@ def main(args: Args):
                         # 控制夹爪（使用关节位置控制）
                         if abs(target_gripper_pos - env._current_gripper_pos) > 0.1:
                             env._control_gripper(target_gripper_pos)
+
+                        _append_control_log(
+                            control_log_entries,
+                            t_step=t_step,
+                            chunk_index=chunk_index,
+                            action_index=action_index_in_chunk,
+                            interp_step=1,
+                            interp_steps=1,
+                            state={
+                                "joint_position": obs_data["joint_position"].tolist(),
+                                "gripper_position": float(obs_data["gripper_position"][0]),
+                                "cartesian_position": curr_obs["robot_state"]["cartesian_position"].tolist(),
+                            },
+                            action={
+                                "joint_position": target_joint_pos.tolist(),
+                                "gripper_position": float(target_gripper_pos),
+                                "linear_velocity": linear_vel.tolist(),
+                                "angular_velocity": angular_vel.tolist(),
+                            },
+                            mode="smooth",
+                            timestamp=time.time(),
+                        )
                     else:
-                        # 直接关节位置控制
-                        env.step(action)
+                        # 直接关节位置控制（可选插值提升控制频率）
+                        target_joint_pos = action[:7]
+                        target_gripper_pos = action[-1]
+
+                        # 计算插值步数：保持每个动作仍为 1/CONTROL_FREQUENCY 秒
+                        steps_per_action = max(
+                            1, int(args.interpolated_control_frequency_hz / CONTROL_FREQUENCY)
+                        )
+                        if args.no_smooth_inner_loop and steps_per_action < 2:
+                            # Inner-loop requires per-interpolation-point waiting.
+                            # Ensure we have at least 2 points to interpolate.
+                            steps_per_action = 1
+                        actual_interp_hz = CONTROL_FREQUENCY * steps_per_action
+
+                        if steps_per_action == 1:
+                            env.step(action)
+                            if args.no_smooth_inner_loop:
+                                _wait_until_reached(
+                                    env,
+                                    target_joint_pos,
+                                    pos_tol=args.no_smooth_inner_loop_pos_tol,
+                                    timeout_s=args.no_smooth_inner_loop_timeout_s,
+                                )
+                            _append_control_log(
+                                control_log_entries,
+                                t_step=t_step,
+                                chunk_index=chunk_index,
+                                action_index=action_index_in_chunk,
+                                interp_step=1,
+                                interp_steps=1,
+                                state={
+                                    "joint_position": obs_data["joint_position"].tolist(),
+                                    "gripper_position": float(obs_data["gripper_position"][0]),
+                                    "cartesian_position": curr_obs["robot_state"]["cartesian_position"].tolist(),
+                                },
+                                action={
+                                    "joint_position": target_joint_pos.tolist(),
+                                    "gripper_position": float(target_gripper_pos),
+                                },
+                                mode="direct",
+                                timestamp=time.time(),
+                            )
+                        else:
+                            start_joint_pos = (
+                                last_commanded_joint_pos
+                                if last_commanded_joint_pos is not None
+                                else obs_data["joint_position"]
+                            )
+                            interpolated_joints = _interpolate_joint_targets(
+                                start_joint_pos, target_joint_pos, steps_per_action
+                            )
+
+                            for interp_step_index, joint_target in enumerate(
+                                interpolated_joints, start=1
+                            ):
+                                sub_action = np.concatenate(
+                                    [joint_target, np.array([target_gripper_pos])]
+                                )
+                                sub_step_start = time.time()
+                                env.step(sub_action)
+                                _append_control_log(
+                                    control_log_entries,
+                                    t_step=t_step,
+                                    chunk_index=chunk_index,
+                                    action_index=action_index_in_chunk,
+                                    interp_step=interp_step_index,
+                                    interp_steps=len(interpolated_joints),
+                                    state={
+                                        "joint_position": obs_data["joint_position"].tolist(),
+                                        "gripper_position": float(obs_data["gripper_position"][0]),
+                                        "cartesian_position": curr_obs["robot_state"]["cartesian_position"].tolist(),
+                                    },
+                                    action={
+                                        "joint_position": joint_target.tolist(),
+                                        "gripper_position": float(target_gripper_pos),
+                                    },
+                                    mode="direct_interp",
+                                    timestamp=time.time(),
+                                )
+                                if args.no_smooth_inner_loop:
+                                    _wait_until_reached(
+                                        env,
+                                        joint_target,
+                                        pos_tol=args.no_smooth_inner_loop_pos_tol,
+                                        timeout_s=args.no_smooth_inner_loop_timeout_s,
+                                    )
+                                else:
+                                    _sleep_to_rate(sub_step_start, actual_interp_hz)
+
+                        last_commanded_joint_pos = target_joint_pos
 
                     # 获取执行后的关节角度
                     post_obs = env.get_observation()
@@ -341,6 +547,9 @@ def main(args: Args):
             # 保存视频
             if video_frames:
                 _save_video(video_frames, timestamp)
+
+            # 保存控制日志
+            _save_control_log(control_log_entries, timestamp)
 
             # 询问结果
             success = input("任务是否成功? (y/n): ")

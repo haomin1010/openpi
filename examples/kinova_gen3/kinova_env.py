@@ -387,7 +387,7 @@ class KinovaRobotEnv:
 
         # 根据动作模式处理关节动作
         if self._config.action_mode == ActionMode.ABSOLUTE:
-            print("111111111")
+            #print("111111111")
             # 绝对位置模式：直接使用 action 作为目标位置
             target_positions = joint_action
         elif self._config.action_mode == ActionMode.DELTA:

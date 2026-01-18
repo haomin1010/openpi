@@ -171,3 +171,5 @@ cython_debug/
 examples/kinova_gen3/wheels/*.whl   
 examples/kinova_gen3/*error*.txt
 videos
+*.png
+logs
