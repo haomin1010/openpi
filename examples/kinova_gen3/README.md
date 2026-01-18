@@ -17,9 +17,9 @@ python main.py \
   --external-serial <外部相机序列号> \
   --wrist-serial <腕部相机序列号>
 
-python examples/kinova_gen3/main.py   --remote-host 127.0.0.1   --remote-port 8000   --robot-ip 192.168.1.10 --no-safety --no-smooth --no-smooth-inner-loop --interpolated_control_frequency_hz 360
+python examples/kinova_gen3/main.py   --remote-host 127.0.0.1   --remote-port 8000   --robot-ip 192.168.1.10 --no-safety --control-mode no-smooth --no-smooth-inner-loop --control-freq 360
 
-
+python examples/kinova_gen3/main.py   --remote-host 127.0.0.1   --remote-port 8000   --robot-ip 192.168.1.10 --control-mode waypoints --waypoints-inner-loop --safety False --control-freq 1
 
 # Kinova Gen3 OpenPI 策略推理
 
@@ -167,7 +167,23 @@ python main.py \
     --external-serial <外部相机序列号> \
     --wrist-serial <腕部相机序列号> \
     --remote-host <策略服务器IP> \
-    --no-smooth \
+    --control-mode no-smooth \
+    --control-freq 1 \
+    --inter 3
+```
+
+**使用 Waypoints 轨迹（安全模式）：**
+
+```bash
+python main.py \
+    --robot-ip 192.168.1.10 \
+    --gripper-ip 192.168.1.43 \
+    --external-serial <外部相机序列号> \
+    --wrist-serial <腕部相机序列号> \
+    --remote-host <策略服务器IP> \
+    --control-mode waypoints \
+    --safety \
+    --safety-mode soft \
     --control-freq 1 \
     --inter 3
 ```
@@ -207,22 +223,34 @@ python main.py \
 | `--control-freq` | `1` | 控制频率（每秒动作数） |
 | `--inter` | `0` | 插值点数：<br>- `0`: 不插值（默认）<br>- `N>0`: 在每两个动作点之间插入 N 个中间点 |
 
-### 平滑控制参数
+### 控制模式参数（互斥）
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--smooth` | `True` | 是否启用平滑控制（速度控制和平滑滤波，默认启用） |
-| `--no-smooth` | - | 禁用平滑控制（使用原始位置控制模式） |
+| `--control-mode` | `smooth` | 控制模式，可选值：<br>- `smooth`: 速度控制（默认）<br>- `no-smooth`: 关节角度控制（单点），使用 `ExecuteAction`<br>- `waypoints`: 关节角度轨迹控制，使用 `action.execute_waypoint_list.waypoints` |
+
+**默认模式：** `smooth`（速度控制）
+
+### 平滑控制参数（速度控制）
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
 | `--smoothing-window-size` | `5` | 平滑窗口大小（用于轨迹平滑的点数） |
 | `--max-linear-velocity` | `0.05` | 最大线速度 (m/s)，默认 5 cm/s |
 | `--max-angular-velocity` | `0.5` | 最大角速度 (rad/s) |
 | `--position-gain` | `2.0` | 位置控制增益（比例控制器增益） |
 | `--orientation-gain` | `1.0` | 姿态控制增益 |
 
-**平滑控制说明：**
-- 平滑控制使用速度控制和平滑滤波实现更平滑的运动
-- 适用于精细操作和需要平滑轨迹的任务
-- 禁用平滑控制时，使用原始关节位置控制模式
+**控制模式说明与调用 API：**
+- **平滑模式（默认，`--control-mode smooth`）**：
+  - 控制原理：基于关节角度通过 URDF 正运动学得到末端位姿，使用速度控制进行平滑追踪。
+  - 调用 API：`Base.SendTwistCommand`（速度指令）。
+- **非平滑模式（`--control-mode no-smooth`）**：
+  - 控制原理：直接发送目标关节角度（绝对位置或增量），每个动作点单独下发。
+  - 调用 API：`Base.ExecuteAction` + `Action.reach_joint_angles`。
+- **Waypoints 模式（`--control-mode waypoints`）**：
+  - 控制原理：将策略输出的 action chunk 规划为关节轨迹（可插值），一次性下发多个轨迹点，底层执行平滑轨迹。
+  - 调用 API：`Base.ExecuteAction` + `Action.execute_waypoint_list.waypoints`。
 
 ### 安全检测参数
 
@@ -255,8 +283,9 @@ python main.py \
 
 **动作执行模式：**
 
-- **平滑控制模式（默认）**：模型输出的关节角度通过 URDF 正运动学转换为末端位置，使用速度控制实现平滑运动
-- **原始位置控制模式**（`--no-smooth`）：策略输出的动作直接作为目标关节位置执行
+- **平滑控制模式（默认，`--control-mode smooth`）**：URDF 正运动学 + 速度控制，调用 `SendTwistCommand`
+- **原始位置控制模式**（`--control-mode no-smooth`）：单点关节角度控制，调用 `ExecuteAction`
+- **Waypoints 模式**（`--control-mode waypoints`）：关节轨迹控制，调用 `ExecuteAction` 的 waypoint 列表
 - 动作模式（`--action-mode`）：
   - `absolute`: 绝对位置模式（默认），动作直接作为目标关节位置
   - `delta`: 增量模式，动作是相对当前位置的增量
@@ -315,7 +344,7 @@ python control_gripper.py --host 192.168.1.43 --speed -20.0 --angle 1872
 
 2. **平滑控制**:
    - 平滑控制（默认启用）提供更平滑的运动，适合精细操作
-   - 如需更快的响应速度，可以使用 `--no-smooth` 禁用平滑控制
+   - 如需更快的响应速度，可以使用 `--control-mode no-smooth` 禁用平滑控制
    - 平滑窗口大小影响平滑程度：较大的窗口（如 7）更平滑但响应更慢，较小的窗口（如 3）响应更快但可能不够平滑
 
 3. **网络延迟**: 建议使用有线网络连接策略服务器，延迟 0.5-1 秒是正常的

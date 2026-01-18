@@ -57,6 +57,10 @@ if "PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION" not in os.environ:
 try:
     from kortex_api.autogen.client_stubs.BaseClientRpc import BaseClient
     from kortex_api.autogen.client_stubs.BaseCyclicClientRpc import BaseCyclicClient
+    try:
+        from kortex_api.autogen.client_stubs.ControlConfigClientRpc import ControlConfigClient
+    except Exception:
+        ControlConfigClient = None
     from kortex_api.autogen.messages import Base_pb2, BaseCyclic_pb2, Common_pb2, Session_pb2
     from kortex_api.RouterClient import RouterClient
     from kortex_api.SessionManager import SessionManager
@@ -259,6 +263,15 @@ class KinovaRobotEnv:
         # 创建服务客户端
         self._base = BaseClient(self._router)
         self._base_cyclic = BaseCyclicClient(self._router)
+        if ControlConfigClient is not None:
+            try:
+                self._control_config = ControlConfigClient(self._router)
+            except Exception as exc:
+                logger.warning(f"初始化 ControlConfigClient 失败: {exc}")
+                self._control_config = None
+        else:
+            self._control_config = None
+        self._joint_position_limits_deg: Optional[list[tuple[float, float]]] = None
 
         # 获取关节数量
         base_servo_mode = Base_pb2.ServoingModeInformation()
@@ -366,6 +379,81 @@ class KinovaRobotEnv:
             },
         }
 
+    def get_joint_position_limits_deg(self) -> Optional[list[tuple[float, float]]]:
+        """返回关节位置硬限（度），缓存结果。"""
+        if self._joint_position_limits_deg is not None:
+            return self._joint_position_limits_deg
+        if self._control_config is None:
+            logger.warning("ControlConfigClient 不可用，无法读取关节硬限")
+            return None
+        try:
+            hard_limits = self._control_config.GetKinematicHardLimits()
+        except Exception as exc:
+            logger.warning(f"读取关节硬限失败: {exc}")
+            return None
+
+        def _extract_min_max(obj):
+            for lo_key, hi_key in (
+                ("min", "max"),
+                ("min_value", "max_value"),
+                ("lower", "upper"),
+                ("min_position", "max_position"),
+            ):
+                if hasattr(obj, lo_key) and hasattr(obj, hi_key):
+                    return float(getattr(obj, lo_key)), float(getattr(obj, hi_key))
+            return None
+
+        def _extract_from_limit(limit):
+            for attr in (
+                "position_limits",
+                "position_limit",
+                "joint_position_limits",
+                "joint_position_limit",
+            ):
+                if hasattr(limit, attr):
+                    pos = getattr(limit, attr)
+                    if hasattr(pos, "__iter__") and not hasattr(pos, "min"):
+                        for item in pos:
+                            res = _extract_min_max(item)
+                            if res:
+                                return res
+                    else:
+                        res = _extract_min_max(pos)
+                        if res:
+                            return res
+            return _extract_min_max(limit)
+
+        candidates: list[tuple[float, float]] = []
+        for attr in ("actuator_limits", "joint_limits", "actuators", "joints"):
+            if hasattr(hard_limits, attr):
+                items = getattr(hard_limits, attr)
+                for item in items:
+                    res = _extract_from_limit(item)
+                    if res:
+                        candidates.append(res)
+
+        if not candidates:
+            logger.warning("无法从硬限对象中解析关节位置硬限")
+            return None
+
+        parsed: list[tuple[float, float]] = []
+        for lo, hi in candidates[:NUM_JOINTS]:
+            max_abs = max(abs(lo), abs(hi))
+            if max_abs <= 2 * math.pi + 0.1:
+                parsed.append((math.degrees(lo), math.degrees(hi)))
+            else:
+                parsed.append((lo, hi))
+
+        if len(parsed) != NUM_JOINTS:
+            logger.warning(
+                f"解析到的关节硬限数量异常: {len(parsed)} (期望 {NUM_JOINTS})"
+            )
+            return None
+
+        self._joint_position_limits_deg = parsed
+        logger.info(f"关节位置硬限(度): {parsed}")
+        return self._joint_position_limits_deg
+
     def step(self, action: np.ndarray):
         """
         执行动作。
@@ -443,9 +531,79 @@ class KinovaRobotEnv:
         for i, pos in enumerate(target_positions):
             joint_angle = action.reach_joint_angles.joint_angles.joint_angles.add()
             joint_angle.joint_identifier = i
-            joint_angle.value = math.degrees(pos) % 360  # kortex 使用角度
+            deg = math.degrees(pos)
+            deg = (deg + 180.0) % 360.0 - 180.0  # keep within [-180, 180]
+            joint_angle.value = deg
 
         # 执行动作（非阻塞）
+        self._base.ExecuteAction(action)
+
+    def _execute_joint_waypoints(
+        self,
+        waypoint_positions: np.ndarray,
+        waypoint_durations: np.ndarray,
+        *,
+        blending_radius: float = 0.0,
+    ) -> None:
+        """
+        使用 Waypoints 方式执行关节轨迹（非阻塞）。
+
+        Args:
+            waypoint_positions: (N, 7) 目标关节位置（弧度）
+            waypoint_durations: (N,) 每个点的持续时间（秒，当前点相对上一点）
+            blending_radius: 平滑半径（单位为关节角度，默认 0）
+        """
+        waypoint_positions = np.asarray(waypoint_positions, dtype=float)
+        waypoint_durations = np.asarray(waypoint_durations, dtype=float)
+        if waypoint_positions.ndim != 2 or waypoint_positions.shape[1] != NUM_JOINTS:
+            raise ValueError(
+                f"waypoint_positions 维度应为 (N, {NUM_JOINTS})，但收到 {waypoint_positions.shape}"
+            )
+        if waypoint_durations.shape[0] != waypoint_positions.shape[0]:
+            raise ValueError(
+                "waypoint_durations 长度应与 waypoint_positions 的点数一致"
+            )
+
+        action = Base_pb2.Action()
+        action.name = "joint_trajectory_waypoints"
+        action.application_data = ""
+
+        wp_list = action.execute_waypoint_list.waypoints
+        for i, joint_pos in enumerate(waypoint_positions):
+            wp = wp_list.add()
+            # Kortex (your version) uses angular_waypoint.angles (float list)
+            angular_wp = wp.angular_waypoint
+            for j, pos in enumerate(joint_pos):
+                deg = math.degrees(pos)
+                deg = (deg + 180.0) % 360.0 - 180.0  # keep within [-180, 180]
+                angular_wp.angles.append(deg)
+            angular_wp.duration = float(waypoint_durations[i])
+
+        # Validate waypoint list before execution
+        try:
+            validation_result = self._base.ValidateWaypointList(action.execute_waypoint_list)
+            error_report = getattr(validation_result, "trajectory_error_report", None)
+            if error_report is not None and error_report.trajectory_error_elements:
+                error_messages = []
+                for elem in error_report.trajectory_error_elements:
+                    error_type = elem.error_type
+                    error_type_name = Base_pb2.TrajectoryErrorType.Name(error_type) if hasattr(Base_pb2, 'TrajectoryErrorType') else str(error_type)
+                    error_value = getattr(elem, "error_value", 0.0)
+                    max_value = getattr(elem, "max_value", 0.0)
+                    waypoint_index = getattr(elem, "waypoint_index", -1)
+                    error_msg = (
+                        f"waypoint[{waypoint_index}]: {error_type_name} "
+                        f"(error_value={error_value:.3f}, max_value={max_value:.3f})"
+                    )
+                    error_messages.append(error_msg)
+                print(
+                    f"[轨迹验证] ValidateWaypointList 发现 {len(error_report.trajectory_error_elements)} 个错误: {', '.join(error_messages)}"
+                )
+            else:
+                print("[轨迹验证] ValidateWaypointList 通过: 无错误")
+        except Exception as exc:
+            print(f"[轨迹验证] ValidateWaypointList 调用失败: {exc}")
+
         self._base.ExecuteAction(action)
 
     def _send_joint_velocities(self, velocities: np.ndarray):

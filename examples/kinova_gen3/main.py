@@ -21,6 +21,7 @@ import dataclasses
 import datetime
 import faulthandler
 import json
+import math
 import os
 import signal
 import time
@@ -65,6 +66,122 @@ def _interpolate_joint_targets(
     """
     steps = max(1, int(steps))
     return np.linspace(start_joint_pos, end_joint_pos, steps + 1, endpoint=True)[1:]
+
+
+def _clamp_joint_targets_rad(
+    joint_targets: np.ndarray, joint_limits_deg: list[tuple[float, float]]
+) -> np.ndarray:
+    """Clamp joint targets to hard limits in degrees, return radians."""
+    joint_targets = np.asarray(joint_targets, dtype=float)
+    if joint_targets.ndim != 2 or joint_targets.shape[1] != len(joint_limits_deg):
+        return joint_targets
+    targets_deg = np.degrees(joint_targets)
+    # wrap to [-180, 180] for stable clamping
+    targets_deg = (targets_deg + 180.0) % 360.0 - 180.0
+    for j, (lo, hi) in enumerate(joint_limits_deg):
+        targets_deg[:, j] = np.clip(targets_deg[:, j], lo, hi)
+    return np.radians(targets_deg)
+
+
+def _build_waypoint_trajectory(
+    action_chunk: np.ndarray,
+    *,
+    control_frequency: float,
+    inter: int,
+    max_joint_speed_deg_s: float,
+    current_joint_pos: Optional[np.ndarray] = None,
+    max_joint_accel_deg_s2: Optional[float] = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Build a joint waypoint trajectory from an action chunk.
+
+    Args:
+        action_chunk: (N, 8) action chunk with absolute joint targets
+        control_frequency: Control frequency (Hz)
+        inter: Interpolation points between actions
+        max_joint_speed_deg_s: Maximum joint speed (deg/s)
+        current_joint_pos: (7,) Current joint position in radians (optional).
+                          If provided, used to compute first waypoint duration.
+
+    Returns:
+        joint_targets: (N, 7) joint positions
+        durations: (N,) seconds, each point relative to the previous
+        gripper_targets: (N,) gripper targets aligned with joint_targets
+    """
+    # action_chunk is expected to contain absolute joint targets.
+    action_chunk = np.asarray(action_chunk)
+    if action_chunk.size == 0:
+        return np.zeros((0, 7)), np.zeros((0,)), np.zeros((0,))
+
+    joint_targets = []
+    gripper_targets = []
+
+    # Always include the first action
+    joint_targets.append(action_chunk[0][:7])
+    gripper_targets.append(action_chunk[0][-1])
+
+    for i in range(len(action_chunk) - 1):
+        start = action_chunk[i][:7]
+        end = action_chunk[i + 1][:7]
+        interpolated = _interpolate_joint_targets(start, end, inter + 1)
+        for k, joint_target in enumerate(interpolated):
+            joint_targets.append(joint_target)
+            if k == len(interpolated) - 1:
+                gripper_targets.append(action_chunk[i + 1][-1])
+            else:
+                gripper_targets.append(action_chunk[i][-1])
+
+    def _min_duration_deg(delta_deg: np.ndarray) -> float:
+        max_speed = max(max_joint_speed_deg_s, 1e-6)
+        safety_scale = 1.2
+        if max_joint_accel_deg_s2 is None:
+            max_delta_deg = float(np.max(delta_deg))
+            duration = max_delta_deg / max_speed
+            return max(duration * safety_scale, 0.01)
+        max_accel = max(max_joint_accel_deg_s2, 1e-6)
+        per_joint = []
+        for d in np.abs(delta_deg):
+            if d <= 0.0:
+                per_joint.append(0.01)
+                continue
+            accel_dist = (max_speed ** 2) / max_accel
+            if d <= accel_dist:
+                t = 2.0 * math.sqrt(d / max_accel)
+            else:
+                t = 2.0 * (max_speed / max_accel) + (d - accel_dist) / max_speed
+            per_joint.append(max(t, 0.01))
+        base = float(np.max(per_joint)) if per_joint else 0.01
+        return max(base * safety_scale, 0.01)
+
+    # Derive per-step durations based on joint speed/accel limits (deg/s, deg/s^2).
+    durations = []
+    if len(joint_targets) <= 1:
+        if current_joint_pos is not None:
+            delta_rad = np.abs(joint_targets[0] - current_joint_pos)
+            delta_deg = np.degrees(delta_rad)
+            durations = [_min_duration_deg(delta_deg)]
+        else:
+            durations = [1.0 / max(control_frequency, 1e-6)]
+    else:
+        # First waypoint duration
+        if current_joint_pos is not None:
+            delta_rad = np.abs(joint_targets[0] - current_joint_pos)
+            delta_deg = np.degrees(delta_rad)
+            durations.append(_min_duration_deg(delta_deg))
+        else:
+            durations.append(0.01)
+
+        # Remaining waypoint durations
+        for idx in range(1, len(joint_targets)):
+            delta_rad = np.abs(joint_targets[idx] - joint_targets[idx - 1])
+            delta_deg = np.degrees(delta_rad)
+            durations.append(_min_duration_deg(delta_deg))
+
+    return (
+        np.asarray(joint_targets, dtype=float),
+        np.asarray(durations, dtype=float),
+        np.asarray(gripper_targets, dtype=float),
+    )
 
 
 def _wait_until_reached(
@@ -169,7 +286,11 @@ class Args:
     # =========================================================================
     # 平滑控制配置
     # =========================================================================
-    smooth: bool = True
+    # 三种互斥控制模式：
+    # - smooth: 速度控制（默认）
+    # - no_smooth: 关节角度控制（单点）
+    # - waypoints: 关节角度控制（轨迹）
+    control_mode: str = "smooth"
     smoothing_window_size: int = 5
     max_linear_velocity: float = 0.05
     max_angular_velocity: float = 0.5
@@ -186,6 +307,19 @@ class Args:
     no_smooth_inner_loop_timeout_s: float = 2.0
 
     # =========================================================================
+    # Waypoints 轨迹执行配置
+    # =========================================================================
+    waypoints_inner_loop: bool = False
+    waypoints_inner_loop_dt: float = 0.1
+    waypoints_inner_loop_pos_tol: float = 0.01
+    waypoints_no_motion_threshold: float = 1e-4
+    waypoints_no_motion_max_count: int = 5
+    waypoints_speed_scale: float = 0.8
+    waypoints_min_joint_speed: float = 5.0
+    waypoints_max_joint_speed: float = 25.0
+    waypoints_max_joint_accel: float = 50.0
+
+    # =========================================================================
     # 安全检测配置
     # =========================================================================
     safety: bool = True
@@ -193,6 +327,52 @@ class Args:
     safety_urdf: Optional[str] = None
     safety_bbox: Optional[str] = None
     safety_joints: Optional[str] = None
+
+
+def _monitor_waypoints_execution(
+    env: KinovaRobotEnv,
+    target_joint_pos: np.ndarray,
+    *,
+    total_duration: float,
+    poll_dt: float,
+    pos_tol: float,
+    no_motion_threshold: float,
+    no_motion_max_count: int,
+) -> tuple[bool, np.ndarray]:
+    """Return (moved, max_joint_speed_rad_s)."""
+    obs = env.get_observation()
+    last_pos = np.array(obs["robot_state"]["joint_positions"], dtype=float)
+    last_time = time.time()
+    max_speed = np.zeros_like(last_pos)
+    no_motion_count = 0
+    start_time = last_time
+
+    while True:
+        time.sleep(poll_dt)
+        obs = env.get_observation()
+        cur_pos = np.array(obs["robot_state"]["joint_positions"], dtype=float)
+        now = time.time()
+        dt = max(now - last_time, 1e-6)
+        delta = cur_pos - last_pos
+        speed = np.abs(delta) / dt
+        max_speed = np.maximum(max_speed, speed)
+
+        if np.linalg.norm(delta) < no_motion_threshold:
+            no_motion_count += 1
+        else:
+            no_motion_count = 0
+
+        if np.linalg.norm(target_joint_pos - cur_pos) <= pos_tol:
+            return True, max_speed
+
+        if no_motion_count >= no_motion_max_count:
+            return False, max_speed
+
+        if now - start_time >= total_duration + 1.0:
+            return True, max_speed
+
+        last_pos = cur_pos
+        last_time = now
 
 
 @contextlib.contextmanager
@@ -229,10 +409,18 @@ def main(args: Args):
         raise ValueError("inter 必须为非负整数")
     control_frequency = float(args.control_freq)
 
+    # 验证控制模式
+    control_mode = args.control_mode
+    if control_mode not in ("smooth", "no_smooth", "waypoints"):
+        raise ValueError(
+            f"未知的控制模式: {control_mode}，必须是 smooth/no_smooth/waypoints 之一"
+        )
+
     # 初始化机器人环境
     print(f"连接 Kinova 机械臂: {args.robot_ip}")
     print(f"连接夹爪控制器: {args.gripper_ip}")
     print(f"动作模式: {args.action_mode}")
+    print(f"控制模式: {control_mode}")
     env = KinovaRobotEnv(
         robot_ip=args.robot_ip,
         gripper_ip=args.gripper_ip,
@@ -241,6 +429,12 @@ def main(args: Args):
         action_mode=args.action_mode,
     )
     print("机器人环境创建成功!")
+
+    joint_limits_deg = None
+    if control_mode == "waypoints":
+        joint_limits_deg = env.get_joint_position_limits_deg()
+        if joint_limits_deg is None:
+            print("[轨迹] 未获取到关节硬限，将不进行关节限位 clamp")
 
     # 初始化安全检测器（可选）
     safety_monitor = None
@@ -272,7 +466,7 @@ def main(args: Args):
     smoother = None
     velocity_controller = None
     kinematics = None
-    if args.smooth:
+    if control_mode == "smooth":
         smoother = TrajectorySmoother(window_size=args.smoothing_window_size)
         velocity_controller = CartesianVelocityController(
             max_linear_velocity=args.max_linear_velocity,
@@ -312,6 +506,7 @@ def main(args: Args):
             bar = tqdm.tqdm(range(args.max_timesteps), desc="执行中")
             print("开始执行... 按 Ctrl+C 或 ESC/q 键停止")
 
+            estop_triggered = False
             for t_step in bar:
                 start_time = time.time()
                 try:
@@ -361,20 +556,6 @@ def main(args: Args):
                     else:
                         action = np.concatenate([action[:-1], np.zeros((1,))])
 
-                    # 安全检测（若启用）
-                    if safety_monitor is not None and args.smooth:
-                        if not safety_monitor.check_and_handle(env, obs_data["joint_position"]):
-                            # 软急停：速度控制发送零速度，位置控制跳过指令
-                            if env._base is not None:
-                                stop_cmd = create_stop_command()
-                                if stop_cmd is not None:
-                                    env._base.SendTwistCommand(stop_cmd)
-                            # 等待以匹配控制频率
-                            elapsed_time = time.time() - start_time
-                            if elapsed_time < 1 / control_frequency:
-                                time.sleep(1 / control_frequency - elapsed_time)
-                            continue
-
                     # 打印执行前的 action
                     joint_angles_str = ", ".join([f"{x:.4f}" for x in action[:7]])
                     gripper_str = f"{action[-1]:.4f}"
@@ -383,11 +564,30 @@ def main(args: Args):
                     print(f"  夹爪位置: {gripper_str}")
 
                     # 执行动作（平滑/速度控制 或 直接位置控制）
-                    if args.smooth:
-                        # 计算目标末端位置（由关节角度通过 URDF 正运动学推导）
-                        target_joint_pos = action[:7]
-                        target_gripper_pos = action[-1]
+                    skip_rate_sleep = False
+                    target_joint_pos = action[:7]
+                    target_gripper_pos = action[-1]
 
+                    if control_mode == "smooth":
+                        # 安全检测（若启用）
+                        if safety_monitor is not None:
+                            try:
+                                if not safety_monitor.check_and_handle(env, target_joint_pos):
+                                    print("[安全] 软急停: 速度置零，等待下一条指令")
+                                    if env._base is not None:
+                                        stop_cmd = create_stop_command()
+                                        if stop_cmd is not None:
+                                            env._base.SendTwistCommand(stop_cmd)
+                                    elapsed_time = time.time() - start_time
+                                    if elapsed_time < 1 / control_frequency:
+                                        time.sleep(1 / control_frequency - elapsed_time)
+                                    continue
+                            except RuntimeError as exc:
+                                print(f"[安全] 硬急停: {exc}")
+                                estop_triggered = True
+                                break
+
+                        # 计算目标末端位置（由关节角度通过 URDF 正运动学推导）
                         joint_xyz, target_eef_pos, target_eef_rot = (
                             kinematics.compute_joint_positions_and_pose(target_joint_pos)
                         )
@@ -442,20 +642,24 @@ def main(args: Args):
                             mode="smooth",
                             timestamp=time.time(),
                         )
-                    else:
+                    elif control_mode == "no_smooth":
                         # 直接关节位置控制（可选插值）
-                        target_joint_pos = action[:7]
-                        target_gripper_pos = action[-1]
                         if args.inter <= 0 or action_index_in_chunk >= len(pred_action_chunk) - 1:
                             if safety_monitor is not None:
-                                if not safety_monitor.check_and_handle(env, target_joint_pos):
-                                    print(
-                                        f"[安全] 跳过不安全动作: t={t_step}, action_index={action_index_in_chunk}"
-                                    )
-                                    elapsed_time = time.time() - start_time
-                                    if elapsed_time < 1 / control_frequency:
-                                        time.sleep(1 / control_frequency - elapsed_time)
-                                    continue
+                                try:
+                                    if not safety_monitor.check_and_handle(env, target_joint_pos):
+                                        print(
+                                            f"[安全] 软急停: 跳过不安全动作: "
+                                            f"t={t_step}, action_index={action_index_in_chunk}"
+                                        )
+                                        elapsed_time = time.time() - start_time
+                                        if elapsed_time < 1 / control_frequency:
+                                            time.sleep(1 / control_frequency - elapsed_time)
+                                        continue
+                                except RuntimeError as exc:
+                                    print(f"[安全] 硬急停: {exc}")
+                                    estop_triggered = True
+                                    break
                             env.step(action)
                             if args.no_smooth_inner_loop:
                                 _wait_until_reached(
@@ -503,14 +707,19 @@ def main(args: Args):
                             ):
                                 sub_step_start = time.time()
                                 if safety_monitor is not None:
-                                    if not safety_monitor.check_and_handle(env, joint_target):
-                                        print(
-                                            "[安全] 跳过不安全插值动作: "
-                                            f"t={t_step}, action_index={action_index_in_chunk}, "
-                                            f"interp_step={interp_step_index}"
-                                        )
-                                        _sleep_to_rate(sub_step_start, actual_interp_hz)
-                                        continue
+                                    try:
+                                        if not safety_monitor.check_and_handle(env, joint_target):
+                                            print(
+                                                "[安全] 软急停: 跳过不安全插值动作: "
+                                                f"t={t_step}, action_index={action_index_in_chunk}, "
+                                                f"interp_step={interp_step_index}"
+                                            )
+                                            _sleep_to_rate(sub_step_start, actual_interp_hz)
+                                            continue
+                                    except RuntimeError as exc:
+                                        print(f"[安全] 硬急停: {exc}")
+                                        estop_triggered = True
+                                        break
                                 sub_action = np.concatenate(
                                     [joint_target, np.array([target_gripper_pos])]
                                 )
@@ -544,7 +753,123 @@ def main(args: Args):
                                 else:
                                     _sleep_to_rate(sub_step_start, actual_interp_hz)
 
+                            if estop_triggered:
+                                break
+
                         last_commanded_joint_pos = target_joint_pos
+                    else:
+                        # waypoints: use trajectory execution
+                        chunk_actions = np.array(pred_action_chunk, copy=True)
+                        # Binarize gripper for the whole chunk
+                        chunk_actions[:, -1] = np.where(
+                            chunk_actions[:, -1] > 0.5, 1.0, 0.0
+                        )
+                        if args.action_mode == ActionMode.DELTA:
+                            # Convert delta actions to absolute joint targets
+                            base_joint_pos = obs_data["joint_position"]
+                            abs_joints = np.zeros_like(chunk_actions[:, :7])
+                            running = np.array(base_joint_pos, dtype=float)
+                            for idx in range(len(chunk_actions)):
+                                running = running + chunk_actions[idx][:7]
+                                abs_joints[idx] = running
+                            chunk_actions[:, :7] = abs_joints
+                        elif args.action_mode == ActionMode.VELOCITY:
+                            raise ValueError("waypoints 模式不支持 velocity 动作模式")
+
+                        speed_limit = args.waypoints_max_joint_speed
+                        accel_limit = args.waypoints_max_joint_accel if args.waypoints_inner_loop else None
+                        joint_targets, durations, gripper_targets = _build_waypoint_trajectory(
+                            chunk_actions,
+                            control_frequency=control_frequency,
+                            inter=args.inter,
+                            max_joint_speed_deg_s=speed_limit,
+                            current_joint_pos=obs_data["joint_position"],
+                            max_joint_accel_deg_s2=accel_limit,
+                        )
+                        if joint_limits_deg is not None and joint_targets.size > 0:
+                            clamped_targets = _clamp_joint_targets_rad(
+                                joint_targets, joint_limits_deg
+                            )
+                            if not np.allclose(clamped_targets, joint_targets):
+                                print("[轨迹] 关节目标超出硬限，已自动 clamp")
+                            joint_targets = clamped_targets
+                        if joint_targets.size == 0:
+                            print("[安全] 轨迹为空，跳过执行")
+                        else:
+                            if safety_monitor is not None:
+                                last_safe_idx = -1
+                                try:
+                                    for idx, joint_target in enumerate(joint_targets):
+                                        if not safety_monitor.check_and_handle(env, joint_target):
+                                            print(
+                                                "[安全] 软急停: 轨迹超界，截断到最后安全点 "
+                                                f"index={last_safe_idx}"
+                                            )
+                                            break
+                                        last_safe_idx = idx
+                                except RuntimeError as exc:
+                                    print(f"[安全] 硬急停: {exc}")
+                                    estop_triggered = True
+
+                                if not estop_triggered:
+                                    if last_safe_idx < 0:
+                                        print("[安全] 软急停: 轨迹全部超界，跳过执行")
+                                    else:
+                                        if last_safe_idx < len(joint_targets) - 1:
+                                            joint_targets = joint_targets[: last_safe_idx + 1]
+                                            durations = durations[: last_safe_idx + 1]
+                                            gripper_targets = gripper_targets[: last_safe_idx + 1]
+
+                            if not estop_triggered:
+                                print(
+                                    f"[轨迹] waypoints={len(joint_targets)}, "
+                                    f"总时长≈{durations.sum():.2f}s, "
+                                    f"speed_limit={speed_limit:.2f} deg/s"
+                                )
+
+                                env._execute_joint_waypoints(
+                                    joint_targets,
+                                    durations,
+                                    blending_radius=0.0,
+                                )
+                                target_gripper_pos = float(gripper_targets[-1])
+                                if abs(target_gripper_pos - env._current_gripper_pos) > 0.1:
+                                    env._control_gripper(target_gripper_pos)
+
+                                if args.waypoints_inner_loop:
+                                    _monitor_waypoints_execution(
+                                        env,
+                                        joint_targets[-1],
+                                        total_duration=float(np.sum(durations)),
+                                        poll_dt=args.waypoints_inner_loop_dt,
+                                        pos_tol=args.waypoints_inner_loop_pos_tol,
+                                        no_motion_threshold=args.waypoints_no_motion_threshold,
+                                        no_motion_max_count=args.waypoints_no_motion_max_count,
+                                    )
+
+                        for idx, joint_target in enumerate(joint_targets):
+                            _append_control_log(
+                                control_log_entries,
+                                t_step=t_step,
+                                chunk_index=chunk_index,
+                                action_index=idx,
+                                interp_step=idx + 1,
+                                interp_steps=len(joint_targets),
+                                state={
+                                    "joint_position": obs_data["joint_position"].tolist(),
+                                    "gripper_position": float(obs_data["gripper_position"][0]),
+                                    "cartesian_position": curr_obs["robot_state"]["cartesian_position"].tolist(),
+                                },
+                                action={
+                                    "joint_position": joint_target.tolist(),
+                                    "gripper_position": float(gripper_targets[idx]),
+                                },
+                                mode="waypoints",
+                                timestamp=time.time(),
+                            )
+
+                        skip_rate_sleep = True
+                        actions_from_chunk_completed = args.open_loop_horizon
 
                     # 获取执行后的关节角度
                     post_obs = env.get_observation()
@@ -558,12 +883,24 @@ def main(args: Args):
 
                     # 等待以匹配控制频率
                     elapsed_time = time.time() - start_time
-                    if elapsed_time < 1 / control_frequency:
-                        time.sleep(1 / control_frequency - elapsed_time)
+                    if not skip_rate_sleep:
+                        if elapsed_time < 1 / control_frequency:
+                            time.sleep(1 / control_frequency - elapsed_time)
+                    else:
+                        remaining = durations.sum() - (time.time() - start_time)
+                        if remaining > 0:
+                            time.sleep(remaining)
 
                 except KeyboardInterrupt:
                     print("\n用户中断")
                     break
+
+                if estop_triggered:
+                    break
+
+            if estop_triggered:
+                print("[安全] 已触发硬急停，退出当前任务")
+                break
 
             # 保存视频
             if video_frames:
@@ -583,6 +920,9 @@ def main(args: Args):
             # 重置机器人
             print("重置机器人...")
             env.reset()
+
+            if estop_triggered:
+                break
 
     except Exception as e:
         print(f"发生错误: {e}")
