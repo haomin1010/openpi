@@ -277,6 +277,11 @@ class KinovaRobotEnv:
             width=self._config.camera_width,
             height=self._config.camera_height,
         )
+        
+        # 更新配置中的序列号为实际使用的序列号
+        # 如果序列号为 None，DualRealSenseCamera 会自动分配，我们需要获取实际值
+        self._config.external_camera_serial = self._cameras._external_camera.device_serial
+        self._config.wrist_camera_serial = self._cameras._wrist_camera.device_serial
 
     def _init_estop(self):
         """初始化急停功能"""

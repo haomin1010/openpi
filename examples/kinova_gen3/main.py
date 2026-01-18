@@ -42,8 +42,8 @@ from velocity_controller import CartesianVelocityController, create_stop_command
 
 faulthandler.enable()
 
-# 动作执行频率（每个策略动作的执行周期）
-CONTROL_FREQUENCY = 30  # Hz
+# 动作执行频率默认值（每个策略动作的执行周期）
+DEFAULT_CONTROL_FREQUENCY = 1  # Hz
 
 
 def _sleep_to_rate(start_time: float, hz: float) -> None:
@@ -152,6 +152,9 @@ class Args:
     # 推理配置
     # =========================================================================
     max_timesteps: int = 600  # 最大时间步数
+
+    # 控制频率（每秒动作数）
+    control_freq: int = DEFAULT_CONTROL_FREQUENCY
     
     # 从预测的 action chunk 中执行多少个动作后再查询服务器
     # 8 通常是个好默认值（约 0.5 秒的动作执行）
@@ -166,7 +169,7 @@ class Args:
     # =========================================================================
     # 平滑控制配置
     # =========================================================================
-    smooth: bool = False
+    smooth: bool = True
     smoothing_window_size: int = 5
     max_linear_velocity: float = 0.05
     max_angular_velocity: float = 0.5
@@ -176,9 +179,9 @@ class Args:
     # =========================================================================
     # 无平滑模式下的插值控制配置
     # =========================================================================
-    # 在 --no-smooth 模式下，将动作插值到更高频率以获得更平滑的控制
-    interpolated_control_frequency_hz: int = 120
-    no_smooth_inner_loop: bool = True
+    # 在每两个动作点之间插入的中间点数量（0 表示不插值）
+    inter: int = 0
+    no_smooth_inner_loop: bool = False
     no_smooth_inner_loop_pos_tol: float = 0.01
     no_smooth_inner_loop_timeout_s: float = 2.0
 
@@ -219,6 +222,12 @@ def main(args: Args):
     if args.external_camera_serial is None or args.wrist_camera_serial is None:
         print("警告: 未指定相机序列号，将尝试自动检测")
         print("建议使用 --external-serial 和 --wrist-serial 明确指定")
+
+    if args.control_freq <= 0:
+        raise ValueError("control_freq 必须为正数")
+    if args.inter < 0:
+        raise ValueError("inter 必须为非负整数")
+    control_frequency = float(args.control_freq)
 
     # 初始化机器人环境
     print(f"连接 Kinova 机械臂: {args.robot_ip}")
@@ -353,17 +362,17 @@ def main(args: Args):
                         action = np.concatenate([action[:-1], np.zeros((1,))])
 
                     # 安全检测（若启用）
-                    if safety_monitor is not None:
+                    if safety_monitor is not None and args.smooth:
                         if not safety_monitor.check_and_handle(env, obs_data["joint_position"]):
                             # 软急停：速度控制发送零速度，位置控制跳过指令
-                            if args.smooth and env._base is not None:
+                            if env._base is not None:
                                 stop_cmd = create_stop_command()
                                 if stop_cmd is not None:
                                     env._base.SendTwistCommand(stop_cmd)
                             # 等待以匹配控制频率
                             elapsed_time = time.time() - start_time
-                            if elapsed_time < 1 / CONTROL_FREQUENCY:
-                                time.sleep(1 / CONTROL_FREQUENCY - elapsed_time)
+                            if elapsed_time < 1 / control_frequency:
+                                time.sleep(1 / control_frequency - elapsed_time)
                             continue
 
                     # 打印执行前的 action
@@ -403,7 +412,7 @@ def main(args: Args):
                             current_pose, smoothed_pose
                         )
                         twist_cmd = create_twist_command(
-                            linear_vel, angular_vel, duration_ms=int(1000 / CONTROL_FREQUENCY)
+                            linear_vel, angular_vel, duration_ms=int(1000 / control_frequency)
                         )
                         if twist_cmd is not None:
                             env._base.SendTwistCommand(twist_cmd)
@@ -434,21 +443,19 @@ def main(args: Args):
                             timestamp=time.time(),
                         )
                     else:
-                        # 直接关节位置控制（可选插值提升控制频率）
+                        # 直接关节位置控制（可选插值）
                         target_joint_pos = action[:7]
                         target_gripper_pos = action[-1]
-
-                        # 计算插值步数：保持每个动作仍为 1/CONTROL_FREQUENCY 秒
-                        steps_per_action = max(
-                            1, int(args.interpolated_control_frequency_hz / CONTROL_FREQUENCY)
-                        )
-                        if args.no_smooth_inner_loop and steps_per_action < 2:
-                            # Inner-loop requires per-interpolation-point waiting.
-                            # Ensure we have at least 2 points to interpolate.
-                            steps_per_action = 1
-                        actual_interp_hz = CONTROL_FREQUENCY * steps_per_action
-
-                        if steps_per_action == 1:
+                        if args.inter <= 0 or action_index_in_chunk >= len(pred_action_chunk) - 1:
+                            if safety_monitor is not None:
+                                if not safety_monitor.check_and_handle(env, target_joint_pos):
+                                    print(
+                                        f"[安全] 跳过不安全动作: t={t_step}, action_index={action_index_in_chunk}"
+                                    )
+                                    elapsed_time = time.time() - start_time
+                                    if elapsed_time < 1 / control_frequency:
+                                        time.sleep(1 / control_frequency - elapsed_time)
+                                    continue
                             env.step(action)
                             if args.no_smooth_inner_loop:
                                 _wait_until_reached(
@@ -477,22 +484,36 @@ def main(args: Args):
                                 timestamp=time.time(),
                             )
                         else:
-                            start_joint_pos = (
-                                last_commanded_joint_pos
-                                if last_commanded_joint_pos is not None
-                                else obs_data["joint_position"]
-                            )
+                            next_action = pred_action_chunk[action_index_in_chunk + 1]
+                            if next_action[-1] > 0.5:
+                                next_action = np.concatenate([next_action[:-1], np.ones((1,))])
+                            else:
+                                next_action = np.concatenate([next_action[:-1], np.zeros((1,))])
+                            next_joint_pos = next_action[:7]
+
+                            interp_steps = args.inter + 1
+                            actual_interp_hz = control_frequency * interp_steps
                             interpolated_joints = _interpolate_joint_targets(
-                                start_joint_pos, target_joint_pos, steps_per_action
+                                target_joint_pos, next_joint_pos, args.inter
                             )
 
+                            sub_joint_targets = [target_joint_pos] + list(interpolated_joints)
                             for interp_step_index, joint_target in enumerate(
-                                interpolated_joints, start=1
+                                sub_joint_targets, start=1
                             ):
+                                sub_step_start = time.time()
+                                if safety_monitor is not None:
+                                    if not safety_monitor.check_and_handle(env, joint_target):
+                                        print(
+                                            "[安全] 跳过不安全插值动作: "
+                                            f"t={t_step}, action_index={action_index_in_chunk}, "
+                                            f"interp_step={interp_step_index}"
+                                        )
+                                        _sleep_to_rate(sub_step_start, actual_interp_hz)
+                                        continue
                                 sub_action = np.concatenate(
                                     [joint_target, np.array([target_gripper_pos])]
                                 )
-                                sub_step_start = time.time()
                                 env.step(sub_action)
                                 _append_control_log(
                                     control_log_entries,
@@ -500,7 +521,7 @@ def main(args: Args):
                                     chunk_index=chunk_index,
                                     action_index=action_index_in_chunk,
                                     interp_step=interp_step_index,
-                                    interp_steps=len(interpolated_joints),
+                                    interp_steps=interp_steps,
                                     state={
                                         "joint_position": obs_data["joint_position"].tolist(),
                                         "gripper_position": float(obs_data["gripper_position"][0]),
@@ -537,8 +558,8 @@ def main(args: Args):
 
                     # 等待以匹配控制频率
                     elapsed_time = time.time() - start_time
-                    if elapsed_time < 1 / CONTROL_FREQUENCY:
-                        time.sleep(1 / CONTROL_FREQUENCY - elapsed_time)
+                    if elapsed_time < 1 / control_frequency:
+                        time.sleep(1 / control_frequency - elapsed_time)
 
                 except KeyboardInterrupt:
                     print("\n用户中断")
@@ -600,6 +621,7 @@ def _extract_observation(args: Args, obs_dict: dict, *, save_to_disk: bool = Fal
     # 如果未通过序列号匹配，尝试按顺序获取
     if external_image is None or wrist_image is None:
         images = list(image_dict.values())
+        print(f"len(images): {len(images)}")  
         if len(images) >= 2:
             external_image = images[0]
             wrist_image = images[1]

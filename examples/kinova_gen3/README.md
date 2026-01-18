@@ -124,7 +124,8 @@ python main.py \
     --external-serial <外部相机序列号> \
     --wrist-serial <腕部相机序列号> \
     --remote-host <策略服务器IP> \
-    --remote-port 8000
+    --remote-port 8000 \
+    --control-freq 1
 ```
 
 **使用平滑控制和安全检测（默认已启用）：**
@@ -138,7 +139,8 @@ python main.py \
     --remote-host <策略服务器IP> \
     --smooth \
     --safety \
-    --safety-mode soft
+    --safety-mode soft \
+    --control-freq 1
 ```
 
 **自定义平滑和安全参数：**
@@ -152,7 +154,22 @@ python main.py \
     --remote-host <策略服务器IP> \
     --smoothing-window-size 7 \
     --max-linear-velocity 0.03 \
-    --safety-joints "2 3 4 5 6 7 8"
+    --safety-joints "2 3 4 5 6 7 8" \
+    --control-freq 1
+```
+
+**使用插值（非平滑模式）：**
+
+```bash
+python main.py \
+    --robot-ip 192.168.1.10 \
+    --gripper-ip 192.168.1.43 \
+    --external-serial <外部相机序列号> \
+    --wrist-serial <腕部相机序列号> \
+    --remote-host <策略服务器IP> \
+    --no-smooth \
+    --control-freq 1 \
+    --inter 3
 ```
 
 ### 步骤 3: 输入任务指令
@@ -187,6 +204,8 @@ python main.py \
 | `--max-timesteps` | `600` | 最大执行步数 |
 | `--open-loop-horizon` | `8` | 开环执行步数（从预测的 action chunk 中执行多少个动作后再查询服务器） |
 | `--action-mode` | `absolute` | 动作模式：<br>- `absolute`: 绝对位置模式（默认）<br>- `delta`: 增量模式<br>- `velocity`: 速度模式 |
+| `--control-freq` | `1` | 控制频率（每秒动作数） |
+| `--inter` | `0` | 插值点数：<br>- `0`: 不插值（默认）<br>- `N>0`: 在每两个动作点之间插入 N 个中间点 |
 
 ### 平滑控制参数
 
