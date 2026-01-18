@@ -42,7 +42,7 @@ from velocity_controller import CartesianVelocityController, create_stop_command
 faulthandler.enable()
 
 # 控制频率
-CONTROL_FREQUENCY = 15  # Hz
+CONTROL_FREQUENCY = 30  # Hz
 
 
 @dataclasses.dataclass

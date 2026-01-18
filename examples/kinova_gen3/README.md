@@ -1,3 +1,26 @@
+cd /home/kinova/qyh/openpi_kinova/openpi
+source .venv/bin/activate
+export CUDA_VISIBLE_DEVICES=1
+python scripts/serve_policy.py policy:checkpoint \
+  --policy.config=pi05_kinova \
+  --policy.dir=gs://openpi-assets/checkpoints/pi05_base \
+  --port=8000
+
+
+cd /home/kinova/qyh/openpi_kinova/openpi/examples/kinova_gen3
+source ../../.venv/bin/activate  # 或者使用 examples/kinova_gen3/.venv
+python main.py \
+  --remote-host 127.0.0.1 \
+  --remote-port 8000 \
+  --robot-ip 192.168.1.10 \
+  --gripper-ip 192.168.1.43 \
+  --external-serial <外部相机序列号> \
+  --wrist-serial <腕部相机序列号>
+
+
+
+
+
 # Kinova Gen3 OpenPI 策略推理
 
 使用 OpenPI 服务器对 Kinova Gen3 机械臂进行 VLA（Vision-Language-Action）策略推理。
