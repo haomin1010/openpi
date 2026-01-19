@@ -17,9 +17,9 @@ python main.py \
   --external-serial <外部相机序列号> \
   --wrist-serial <腕部相机序列号>
 
-python examples/kinova_gen3/main.py   --remote-host 127.0.0.1   --remote-port 8000   --robot-ip 192.168.1.10 --no-safety --control-mode no-smooth --no-smooth-inner-loop --control-freq 360
+python examples/kinova_gen3/main.py   --remote-host 127.0.0.1   --remote-port 8000   --robot-ip 192.168.1.10 --no-safety --control-mode no_smooth --no-smooth-inner-loop --control-freq 360
 
-python examples/kinova_gen3/main.py   --remote-host 127.0.0.1   --remote-port 8000   --robot-ip 192.168.1.10 --control-mode waypoints --waypoints-inner-loop --safety False --control-freq 1
+python examples/kinova_gen3/main.py   --remote-host 127.0.0.1   --remote-port 8000   --robot-ip 192.168.1.10 --control-mode waypoints --waypoints-inner-loop --no-safety --control-freq 1
 
 # Kinova Gen3 OpenPI 策略推理
 
