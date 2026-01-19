@@ -1,10 +1,9 @@
 cd /home/kinova/qyh/openpi_kinova/openpi
 source .venv/bin/activate
 export CUDA_VISIBLE_DEVICES=1
-python scripts/serve_policy.py policy:checkpoint \
+python scripts/serve_policy.py --port 8000 policy:checkpoint \
   --policy.config=pi05_kinova \
   --policy.dir=gs://openpi-assets/checkpoints/pi05_base \
-  --port=8000
 
 
 cd /home/kinova/qyh/openpi_kinova/openpi/examples/kinova_gen3
@@ -17,9 +16,11 @@ python main.py \
   --external-serial <外部相机序列号> \
   --wrist-serial <腕部相机序列号>
 
-python examples/kinova_gen3/main.py   --remote-host 127.0.0.1   --remote-port 8000   --robot-ip 192.168.1.10 --no-safety --control-mode no_smooth --no-smooth-inner-loop --control-freq 360
+python examples/kinova_gen3/main.py   --remote-host 127.0.0.1   --remote-port 8000   --robot-ip 192.168.1.10 --no-safety --control-mode no_smooth --no-smooth-inner-loop 
 
 python examples/kinova_gen3/main.py   --remote-host 127.0.0.1   --remote-port 8000   --robot-ip 192.168.1.10 --control-mode waypoints --waypoints-inner-loop --no-safety --control-freq 1
+
+python examples/kinova_gen3/main.py   --remote-host 127.0.0.1   --remote-port 8000   --robot-ip 192.168.1.10 --control-mode waypoints --waypoints-step-to-step --waypoints-inner-loop --no-safety --control-freq 1
 
 # Kinova Gen3 OpenPI 策略推理
 
@@ -39,9 +40,13 @@ python examples/kinova_gen3/main.py   --remote-host 127.0.0.1   --remote-port 80
 ```
 examples/kinova_gen3/
 ├── control_gripper.py     # UDP 夹爪控制
+├── execution_utils.py     # 执行流程相关工具（节拍、inner-loop、键盘中断保护）
+├── io_utils.py            # I/O 工具（观测提取、视频保存）
 ├── kinova_env.py          # KinovaRobotEnv 机器人环境
+├── log_utils.py           # 控制日志记录与保存
 ├── realsense_camera.py    # 双 RealSense 相机封装
-├── main.py                # 推理入口脚本
+├── trajectory_utils.py    # 轨迹/插值/关节限位/waypoints 轨迹构建
+├── main.py                # 推理入口脚本（初始化与主循环）
 └── README.md              # 本文档
 ```
 
@@ -188,6 +193,29 @@ python main.py \
     --inter 3
 ```
 
+**使用 Waypoints 轨迹（Step-to-Step 模式）：**
+
+Step-to-Step 模式将每个 action 点作为独立的轨迹段执行，而不是将整个 action chunk 作为一条完整路径。例如：
+- 第一条轨迹：从当前关节位置到 `action_chunk[0]`
+- 第二条轨迹：从 `action_chunk[0]` 到 `action_chunk[1]`
+- 以此类推...
+
+```bash
+python main.py \
+    --robot-ip 192.168.1.10 \
+    --gripper-ip 192.168.1.43 \
+    --external-serial <外部相机序列号> \
+    --wrist-serial <腕部相机序列号> \
+    --remote-host <策略服务器IP> \
+    --control-mode waypoints \
+    --waypoints-step-to-step \
+    --waypoints-inner-loop \
+    --safety \
+    --safety-mode soft \
+    --control-freq 1 \
+    --inter 3
+```
+
 ### 步骤 3: 输入任务指令
 
 程序启动后，输入自然语言任务指令，例如：
@@ -241,6 +269,21 @@ python main.py \
 | `--position-gain` | `2.0` | 位置控制增益（比例控制器增益） |
 | `--orientation-gain` | `1.0` | 姿态控制增益 |
 
+### Waypoints 轨迹执行参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--waypoints-step-to-step` | `False` | 是否启用 Step-to-Step 模式：<br>- `False`: 将整个 action chunk 规划为一条完整轨迹（默认）<br>- `True`: 将每个 action 点作为独立轨迹段执行 |
+| `--waypoints-inner-loop` | `False` | 是否启用 inner-loop 监控（等待轨迹执行完成） |
+| `--waypoints-inner-loop-dt` | `0.1` | Inner-loop 监控的轮询间隔（秒） |
+| `--waypoints-inner-loop-pos-tol` | `0.01` | Inner-loop 位置容差（弧度） |
+| `--waypoints-no-motion-threshold` | `1e-4` | 无运动检测阈值（弧度） |
+| `--waypoints-no-motion-max-count` | `5` | 无运动检测最大计数 |
+| `--waypoints-speed-scale` | `0.8` | 速度缩放因子 |
+| `--waypoints-min-joint-speed` | `5.0` | 最小关节速度（度/秒） |
+| `--waypoints-max-joint-speed` | `25.0` | 最大关节速度（度/秒） |
+| `--waypoints-max-joint-accel` | `50.0` | 最大关节加速度（度/秒²） |
+
 **控制模式说明与调用 API：**
 - **平滑模式（默认，`--control-mode smooth`）**：
   - 控制原理：基于关节角度通过 URDF 正运动学得到末端位姿，使用速度控制进行平滑追踪。
@@ -251,6 +294,12 @@ python main.py \
 - **Waypoints 模式（`--control-mode waypoints`）**：
   - 控制原理：将策略输出的 action chunk 规划为关节轨迹（可插值），一次性下发多个轨迹点，底层执行平滑轨迹。
   - 调用 API：`Base.ExecuteAction` + `Action.execute_waypoint_list.waypoints`。
+  - **Step-to-Step 模式**（`--waypoints-step-to-step`）：
+    - 将每个 action 点作为独立的轨迹段执行，而不是将整个 action chunk 作为一条完整路径
+    - 第一条轨迹：从当前关节位置到 `action_chunk[0]`（包含插值点）
+    - 后续轨迹：从 `action_chunk[i]` 到 `action_chunk[i+1]`（包含插值点）
+    - 每段轨迹都会独立进行安全检测、关节限位检查和 inner-loop 监控
+    - 如果某段轨迹全部超界，会停止执行后续段（更安全）
 
 ### 安全检测参数
 
@@ -286,6 +335,8 @@ python main.py \
 - **平滑控制模式（默认，`--control-mode smooth`）**：URDF 正运动学 + 速度控制，调用 `SendTwistCommand`
 - **原始位置控制模式**（`--control-mode no-smooth`）：单点关节角度控制，调用 `ExecuteAction`
 - **Waypoints 模式**（`--control-mode waypoints`）：关节轨迹控制，调用 `ExecuteAction` 的 waypoint 列表
+  - **标准模式**：将整个 action chunk 规划为一条完整轨迹
+  - **Step-to-Step 模式**（`--waypoints-step-to-step`）：将每个 action 点作为独立轨迹段执行
 - 动作模式（`--action-mode`）：
   - `absolute`: 绝对位置模式（默认），动作直接作为目标关节位置
   - `delta`: 增量模式，动作是相对当前位置的增量

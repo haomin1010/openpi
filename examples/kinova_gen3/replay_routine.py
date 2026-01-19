@@ -15,8 +15,8 @@ Kinova Gen3 轨迹回放脚本（基于 libero_format 数据）
     # 指定数据根目录
     python replay_routine.py --data-dir /path/to/data
     
-    # 指定 action chunk 和插值频率
-    python replay_routine.py --action-horizon 8 --interpolated-control-frequency-hz 120
+    # 指定 action chunk 和插值步数
+    python replay_routine.py --action-horizon 8 --inter 4
 """
 
 import os
@@ -68,13 +68,23 @@ def _wait_until_reached(
     *,
     pos_tol: float,
     timeout_s: float,
-    poll_dt: float = 0.01,
+    poll_dt: float = 0.02,
 ) -> bool:
-    """Wait until joint positions are within tolerance or timeout."""
+    """Wait until joint positions are within tolerance or timeout.
+    
+    优化：直接使用 RefreshFeedback() 而不是 get_observation()，
+    避免创建图像和处理不必要的数据，减少轮询开销。
+    """
+    import math
     start_time = time.time()
     while True:
-        obs = env.get_observation()
-        actual_joint_pos = obs["robot_state"]["joint_positions"]
+        # 直接使用 RefreshFeedback()，避免 get_observation() 的开销
+        # get_observation() 会创建图像和处理不必要的数据
+        feedback = env._base_cyclic.RefreshFeedback()
+        actual_joint_pos = np.array([
+            math.radians((actuator.position + 180) % 360 - 180)
+            for actuator in feedback.actuators
+        ])
         err = np.linalg.norm(target_joint_pos - actual_joint_pos)
         if err <= pos_tol:
             return True
@@ -173,7 +183,7 @@ def _move_to_start(env: KinovaRobotEnv, start_state: np.ndarray) -> None:
         [start_state[:7], [ _data_gripper_to_env(float(start_state[7])) ]]
     )
     env.step(start_action)
-        time.sleep(1.0)
+    time.sleep(1.0)
 
 
 def _execute_action_chunk(
@@ -182,7 +192,7 @@ def _execute_action_chunk(
     *,
     current_state: np.ndarray,
     base_control_hz: float,
-    interpolated_control_frequency_hz: float,
+    inter: int,
     last_commanded_joint_pos: Optional[np.ndarray],
     log_entries: list,
     chunk_index: int,
@@ -190,18 +200,17 @@ def _execute_action_chunk(
     inner_loop: bool,
     inner_loop_pos_tol: float,
     inner_loop_timeout_s: float,
+    inner_loop_poll_dt: float,
 ) -> tuple[np.ndarray, Optional[np.ndarray]]:
-    steps_per_action = max(1, int(interpolated_control_frequency_hz / base_control_hz))
-    actual_interp_hz = base_control_hz * steps_per_action
-
     for action_index_in_chunk, action_delta in enumerate(chunk):
         global_action_index = chunk_start_index + action_index_in_chunk
-            next_state = current_state + action_delta
-            next_state[7] = float(np.clip(next_state[7], 0.0, 1.0))
-            target_joint_pos = next_state[:7]
+        next_state = current_state + action_delta
+        next_state[7] = float(np.clip(next_state[7], 0.0, 1.0))
+        target_joint_pos = next_state[:7]
         target_gripper_pos = _data_gripper_to_env(float(next_state[7]))
 
-        if steps_per_action == 1:
+        # 判断是否需要插值：inter <= 0 或最后一个 action 时不插值
+        if inter <= 0 or action_index_in_chunk >= len(chunk) - 1:
             step_start = time.time()
             action = np.concatenate([target_joint_pos, [target_gripper_pos]])
             env.step(action)
@@ -237,20 +246,27 @@ def _execute_action_chunk(
                     target_joint_pos,
                     pos_tol=inner_loop_pos_tol,
                     timeout_s=inner_loop_timeout_s,
+                    poll_dt=inner_loop_poll_dt,
                 )
             else:
                 _sleep_to_rate(step_start, base_control_hz)
-                else:
-            if last_commanded_joint_pos is None:
-                obs = env.get_observation()
-                start_joint_pos = obs["robot_state"]["joint_positions"]
-            else:
-                start_joint_pos = last_commanded_joint_pos
+        else:
+            # 插值模式：在当前 action 和下一个 action 之间插值
+            next_action_delta = chunk[action_index_in_chunk + 1]
+            next_next_state = next_state + next_action_delta
+            next_next_state[7] = float(np.clip(next_next_state[7], 0.0, 1.0))
+            next_joint_pos = next_next_state[:7]
 
+            interp_steps = inter + 1
+            actual_interp_hz = base_control_hz * interp_steps
             interpolated_joints = _interpolate_joint_targets(
-                start_joint_pos, target_joint_pos, steps_per_action
+                target_joint_pos, next_joint_pos, inter
             )
-            for interp_step_index, joint_target in enumerate(interpolated_joints, start=1):
+
+            sub_joint_targets = [target_joint_pos] + list(interpolated_joints)
+            for interp_step_index, joint_target in enumerate(
+                sub_joint_targets, start=1
+            ):
                 sub_action = np.concatenate([joint_target, [target_gripper_pos]])
                 sub_step_start = time.time()
                 env.step(sub_action)
@@ -260,7 +276,7 @@ def _execute_action_chunk(
                     action_index_in_chunk=action_index_in_chunk,
                     global_action_index=global_action_index,
                     interp_step=interp_step_index,
-                    interp_steps=len(interpolated_joints),
+                    interp_steps=interp_steps,
                     state={
                         "current_state": current_state.tolist(),
                         "next_state": next_state.tolist(),
@@ -278,7 +294,7 @@ def _execute_action_chunk(
                     action_index_in_chunk,
                     global_action_index,
                     interp_step_index,
-                    len(interpolated_joints),
+                    interp_steps,
                 )
                 if inner_loop:
                     _wait_until_reached(
@@ -286,6 +302,7 @@ def _execute_action_chunk(
                         joint_target,
                         pos_tol=inner_loop_pos_tol,
                         timeout_s=inner_loop_timeout_s,
+                        poll_dt=inner_loop_poll_dt,
                     )
                 else:
                     _sleep_to_rate(sub_step_start, actual_interp_hz)
@@ -343,10 +360,16 @@ def main() -> None:
         help="回放速度倍数（1.0 = 原始速度）",
     )
     parser.add_argument(
-        "--interpolated-control-frequency-hz",
+        "--control-frequency",
         type=float,
-        default=120.0,
-        help="插值控制频率（默认: 120Hz）",
+        default=None,
+        help="控制频率（Hz）。如果未指定，则使用数据文件中的 collection_frequency × playback_speed",
+    )
+    parser.add_argument(
+        "--inter",
+        type=int,
+        default=0,
+        help="在每两个动作点之间插入的中间点数量（0 表示不插值，默认: 0）",
     )
     parser.add_argument(
         "--inner-loop",
@@ -365,16 +388,22 @@ def main() -> None:
         default=2.0,
         help="内环等待超时（秒，默认: 2.0）",
     )
+    parser.add_argument(
+        "--inner-loop-poll-dt",
+        type=float,
+        default=0.02,
+        help="内环轮询间隔（秒，默认: 0.02）。增大此值可减少 CPU 占用，但会降低检查精度",
+    )
     
     args = parser.parse_args()
     
-        script_dir = Path(__file__).parent
+    script_dir = Path(__file__).parent
     data_root = Path(args.data_dir) if args.data_dir else script_dir / "data"
 
     npz_path = _find_latest_libero_npz(data_root)
     if npz_path is None:
         logger.error(f"在 {data_root} 下未找到 libero_format/*.npz")
-            sys.exit(1)
+        sys.exit(1)
 
     logger.info(f"使用数据文件: {npz_path}")
     data = _load_libero_npz(npz_path)
@@ -384,25 +413,37 @@ def main() -> None:
     collection_frequency = data["collection_frequency"]
     task = data["task"]
 
-    base_control_hz = collection_frequency * args.playback_speed
+    # 计算基准控制频率：如果显式指定了控制频率，则使用指定值；否则使用数据文件频率 × 回放速度
+    if args.control_frequency is not None:
+        base_control_hz = args.control_frequency
+        logger.info(
+            "使用显式指定的控制频率: %.2f Hz (数据文件采集频率: %.2f Hz, 回放速度: %.2fx)",
+            base_control_hz,
+            collection_frequency,
+            args.playback_speed,
+        )
+    else:
+        base_control_hz = collection_frequency * args.playback_speed
+        logger.info(
+            "采集频率: %.2f Hz, 回放速度: %.2fx, 基准控制频率: %.2f Hz",
+            collection_frequency,
+            args.playback_speed,
+            base_control_hz,
+        )
+    
     if base_control_hz <= 0:
-        logger.error("无效的回放频率")
-            sys.exit(1)
+        logger.error("无效的控制频率: %.2f Hz", base_control_hz)
+        sys.exit(1)
     
     logger.info(f"任务: {task}")
-    logger.info(
-        "采集频率: %.2f Hz, 回放速度: %.2fx, 基准控制频率: %.2f Hz",
-        collection_frequency,
-        args.playback_speed,
-        base_control_hz,
-    )
-    logger.info("action_horizon: %d, 插值频率: %.2f Hz", args.action_horizon, args.interpolated_control_frequency_hz)
-
+    logger.info("action_horizon: %d, 插值步数: %d", args.action_horizon, args.inter)
+    
+    # 回放轨迹时不需要相机，传入 None 禁用相机连接和检查
     env = KinovaRobotEnv(
         robot_ip=args.robot_ip,
         gripper_ip=args.gripper_ip,
-        external_camera_serial=args.external_camera_serial,
-        wrist_camera_serial=args.wrist_camera_serial,
+        external_camera_serial=None,  # 禁用外部相机
+        wrist_camera_serial=None,  # 禁用腕部相机
         action_mode=ActionMode.ABSOLUTE,
     )
 
@@ -431,7 +472,7 @@ def main() -> None:
                 chunk,
                 current_state=current_state,
                 base_control_hz=base_control_hz,
-                interpolated_control_frequency_hz=args.interpolated_control_frequency_hz,
+                inter=args.inter,
                 last_commanded_joint_pos=last_commanded_joint_pos,
                 log_entries=replay_log_entries,
                 chunk_index=chunk_index,
@@ -439,6 +480,7 @@ def main() -> None:
                 inner_loop=args.inner_loop,
                 inner_loop_pos_tol=args.inner_loop_pos_tol,
                 inner_loop_timeout_s=args.inner_loop_timeout_s,
+                inner_loop_poll_dt=args.inner_loop_poll_dt,
                 )
 
         logger.info("\n轨迹回放完成！")

@@ -283,6 +283,12 @@ class KinovaRobotEnv:
 
     def _init_cameras(self):
         """初始化相机"""
+        # 如果两个相机序列号都为 None，跳过相机初始化
+        if self._config.external_camera_serial is None and self._config.wrist_camera_serial is None:
+            logger.info("相机序列号均为 None，跳过相机初始化")
+            self._cameras = None
+            return
+        
         logger.info("初始化双相机系统...")
         self._cameras = DualRealSenseCamera(
             external_serial=self._config.external_camera_serial,
@@ -344,8 +350,24 @@ class KinovaRobotEnv:
         Returns:
             dict: 包含图像和机器人状态的字典，格式与 DROID 兼容
         """
-        # 获取相机图像
-        external_img, wrist_img = self._cameras.get_frames()
+        # 获取相机图像（如果相机未初始化，返回黑色占位图像）
+        if self._cameras is None:
+            # 创建黑色占位图像
+            external_img = np.zeros(
+                (self._config.camera_height, self._config.camera_width, 3),
+                dtype=np.uint8
+            )
+            wrist_img = np.zeros(
+                (self._config.camera_height, self._config.camera_width, 3),
+                dtype=np.uint8
+            )
+            # 使用占位序列号
+            external_serial = "no_camera_external"
+            wrist_serial = "no_camera_wrist"
+        else:
+            external_img, wrist_img = self._cameras.get_frames()
+            external_serial = self._config.external_camera_serial
+            wrist_serial = self._config.wrist_camera_serial
 
         # 获取机器人状态
         feedback = self._base_cyclic.RefreshFeedback()
@@ -369,8 +391,8 @@ class KinovaRobotEnv:
 
         return {
             "image": {
-                f"{self._config.external_camera_serial}_left": external_img,
-                f"{self._config.wrist_camera_serial}_left": wrist_img,
+                f"{external_serial}_left": external_img,
+                f"{wrist_serial}_left": wrist_img,
             },
             "robot_state": {
                 "joint_positions": joint_positions,
@@ -722,7 +744,7 @@ class KinovaRobotEnv:
             self._estop.stop()
 
         # 关闭相机
-        if hasattr(self, '_cameras'):
+        if hasattr(self, '_cameras') and self._cameras is not None:
             self._cameras.close()
 
         # 断开机器人连接

@@ -16,25 +16,33 @@ Kinova Gen3 机器人 OpenPI 策略推理脚本
     - 也可以使用 pi05_droid checkpoint: --policy.dir=gs://openpi-assets/checkpoints/pi05_droid
 """
 
-import contextlib
 import dataclasses
 import datetime
 import faulthandler
-import json
-import math
 import os
-import signal
 import time
 from typing import Optional
 
 import numpy as np
 from openpi_client import image_tools
 from openpi_client import websocket_client_policy
-from PIL import Image
 import tqdm
 import tyro
 from scipy.spatial.transform import Rotation
 
+from execution_utils import (
+    _monitor_waypoints_execution,
+    _sleep_to_rate,
+    _wait_until_reached,
+    prevent_keyboard_interrupt,
+)
+from io_utils import _extract_observation, _save_video
+from log_utils import _append_control_log, _save_control_log
+from trajectory_utils import (
+    _build_waypoint_trajectory,
+    _clamp_joint_targets_rad,
+    _interpolate_joint_targets,
+)
 from kinova_env import KinovaRobotEnv, ActionMode
 from safety_monitor import SafetyMonitor
 from trajectory_smoothing import TrajectorySmoother
@@ -45,203 +53,6 @@ faulthandler.enable()
 
 # 动作执行频率默认值（每个策略动作的执行周期）
 DEFAULT_CONTROL_FREQUENCY = 1  # Hz
-
-
-def _sleep_to_rate(start_time: float, hz: float) -> None:
-    """Sleep to maintain a target loop rate."""
-    if hz <= 0:
-        return
-    elapsed = time.time() - start_time
-    period = 1.0 / hz
-    if elapsed < period:
-        time.sleep(period - elapsed)
-
-
-def _interpolate_joint_targets(
-    start_joint_pos: np.ndarray, end_joint_pos: np.ndarray, steps: int
-) -> np.ndarray:
-    """Linearly interpolate joint targets between two poses.
-
-    Returns an array with shape (steps, 7). When steps == 1, it returns [end].
-    """
-    steps = max(1, int(steps))
-    return np.linspace(start_joint_pos, end_joint_pos, steps + 1, endpoint=True)[1:]
-
-
-def _clamp_joint_targets_rad(
-    joint_targets: np.ndarray, joint_limits_deg: list[tuple[float, float]]
-) -> np.ndarray:
-    """Clamp joint targets to hard limits in degrees, return radians."""
-    joint_targets = np.asarray(joint_targets, dtype=float)
-    if joint_targets.ndim != 2 or joint_targets.shape[1] != len(joint_limits_deg):
-        return joint_targets
-    targets_deg = np.degrees(joint_targets)
-    # wrap to [-180, 180] for stable clamping
-    targets_deg = (targets_deg + 180.0) % 360.0 - 180.0
-    for j, (lo, hi) in enumerate(joint_limits_deg):
-        targets_deg[:, j] = np.clip(targets_deg[:, j], lo, hi)
-    return np.radians(targets_deg)
-
-
-def _build_waypoint_trajectory(
-    action_chunk: np.ndarray,
-    *,
-    control_frequency: float,
-    inter: int,
-    max_joint_speed_deg_s: float,
-    current_joint_pos: Optional[np.ndarray] = None,
-    max_joint_accel_deg_s2: Optional[float] = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Build a joint waypoint trajectory from an action chunk.
-
-    Args:
-        action_chunk: (N, 8) action chunk with absolute joint targets
-        control_frequency: Control frequency (Hz)
-        inter: Interpolation points between actions
-        max_joint_speed_deg_s: Maximum joint speed (deg/s)
-        current_joint_pos: (7,) Current joint position in radians (optional).
-                          If provided, used to compute first waypoint duration.
-
-    Returns:
-        joint_targets: (N, 7) joint positions
-        durations: (N,) seconds, each point relative to the previous
-        gripper_targets: (N,) gripper targets aligned with joint_targets
-    """
-    # action_chunk is expected to contain absolute joint targets.
-    action_chunk = np.asarray(action_chunk)
-    if action_chunk.size == 0:
-        return np.zeros((0, 7)), np.zeros((0,)), np.zeros((0,))
-
-    joint_targets = []
-    gripper_targets = []
-
-    # Always include the first action
-    joint_targets.append(action_chunk[0][:7])
-    gripper_targets.append(action_chunk[0][-1])
-
-    for i in range(len(action_chunk) - 1):
-        start = action_chunk[i][:7]
-        end = action_chunk[i + 1][:7]
-        interpolated = _interpolate_joint_targets(start, end, inter + 1)
-        for k, joint_target in enumerate(interpolated):
-            joint_targets.append(joint_target)
-            if k == len(interpolated) - 1:
-                gripper_targets.append(action_chunk[i + 1][-1])
-            else:
-                gripper_targets.append(action_chunk[i][-1])
-
-    def _min_duration_deg(delta_deg: np.ndarray) -> float:
-        max_speed = max(max_joint_speed_deg_s, 1e-6)
-        safety_scale = 1.2
-        if max_joint_accel_deg_s2 is None:
-            max_delta_deg = float(np.max(delta_deg))
-            duration = max_delta_deg / max_speed
-            return max(duration * safety_scale, 0.01)
-        max_accel = max(max_joint_accel_deg_s2, 1e-6)
-        per_joint = []
-        for d in np.abs(delta_deg):
-            if d <= 0.0:
-                per_joint.append(0.01)
-                continue
-            accel_dist = (max_speed ** 2) / max_accel
-            if d <= accel_dist:
-                t = 2.0 * math.sqrt(d / max_accel)
-            else:
-                t = 2.0 * (max_speed / max_accel) + (d - accel_dist) / max_speed
-            per_joint.append(max(t, 0.01))
-        base = float(np.max(per_joint)) if per_joint else 0.01
-        return max(base * safety_scale, 0.01)
-
-    # Derive per-step durations based on joint speed/accel limits (deg/s, deg/s^2).
-    durations = []
-    if len(joint_targets) <= 1:
-        if current_joint_pos is not None:
-            delta_rad = np.abs(joint_targets[0] - current_joint_pos)
-            delta_deg = np.degrees(delta_rad)
-            durations = [_min_duration_deg(delta_deg)]
-        else:
-            durations = [1.0 / max(control_frequency, 1e-6)]
-    else:
-        # First waypoint duration
-        if current_joint_pos is not None:
-            delta_rad = np.abs(joint_targets[0] - current_joint_pos)
-            delta_deg = np.degrees(delta_rad)
-            durations.append(_min_duration_deg(delta_deg))
-        else:
-            durations.append(0.01)
-
-        # Remaining waypoint durations
-        for idx in range(1, len(joint_targets)):
-            delta_rad = np.abs(joint_targets[idx] - joint_targets[idx - 1])
-            delta_deg = np.degrees(delta_rad)
-            durations.append(_min_duration_deg(delta_deg))
-
-    return (
-        np.asarray(joint_targets, dtype=float),
-        np.asarray(durations, dtype=float),
-        np.asarray(gripper_targets, dtype=float),
-    )
-
-
-def _wait_until_reached(
-    env: KinovaRobotEnv,
-    target_joint_pos: np.ndarray,
-    *,
-    pos_tol: float,
-    timeout_s: float,
-    poll_dt: float = 0.01,
-) -> bool:
-    """Wait until joint positions are within tolerance or timeout."""
-    start_time = time.time()
-    while True:
-        obs = env.get_observation()
-        actual_joint_pos = obs["robot_state"]["joint_positions"]
-        err = np.linalg.norm(target_joint_pos - actual_joint_pos)
-        if err <= pos_tol:
-            return True
-        if time.time() - start_time >= timeout_s:
-            return False
-        time.sleep(poll_dt)
-
-
-def _append_control_log(
-    log_entries: list,
-    *,
-    t_step: int,
-    chunk_index: int,
-    action_index: int,
-    interp_step: int,
-    interp_steps: int,
-    state: dict,
-    action: dict,
-    mode: str,
-    timestamp: float,
-) -> None:
-    log_entries.append(
-        {
-            "t_step": t_step,
-            "chunk_index": chunk_index,
-            "action_index": action_index,
-            "interp_step": interp_step,
-            "interp_steps": interp_steps,
-            "state": state,
-            "action": action,
-            "mode": mode,
-            "timestamp": timestamp,
-        }
-    )
-
-
-def _save_control_log(log_entries: list, timestamp: str) -> None:
-    if not log_entries:
-        return
-    os.makedirs("logs", exist_ok=True)
-    filename = f"logs/control_log_{timestamp}.jsonl"
-    with open(filename, "w", encoding="utf-8") as f:
-        for entry in log_entries:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    print(f"控制日志已保存: {filename}")
 
 
 @dataclasses.dataclass
@@ -305,6 +116,7 @@ class Args:
     no_smooth_inner_loop: bool = False
     no_smooth_inner_loop_pos_tol: float = 0.01
     no_smooth_inner_loop_timeout_s: float = 2.0
+    no_smooth_inner_loop_poll_dt: float = 0.02
 
     # =========================================================================
     # Waypoints 轨迹执行配置
@@ -314,6 +126,7 @@ class Args:
     waypoints_inner_loop_pos_tol: float = 0.01
     waypoints_no_motion_threshold: float = 1e-4
     waypoints_no_motion_max_count: int = 5
+    waypoints_step_to_step: bool = False
     waypoints_speed_scale: float = 0.8
     waypoints_min_joint_speed: float = 5.0
     waypoints_max_joint_speed: float = 25.0
@@ -327,74 +140,6 @@ class Args:
     safety_urdf: Optional[str] = None
     safety_bbox: Optional[str] = None
     safety_joints: Optional[str] = None
-
-
-def _monitor_waypoints_execution(
-    env: KinovaRobotEnv,
-    target_joint_pos: np.ndarray,
-    *,
-    total_duration: float,
-    poll_dt: float,
-    pos_tol: float,
-    no_motion_threshold: float,
-    no_motion_max_count: int,
-) -> tuple[bool, np.ndarray]:
-    """Return (moved, max_joint_speed_rad_s)."""
-    obs = env.get_observation()
-    last_pos = np.array(obs["robot_state"]["joint_positions"], dtype=float)
-    last_time = time.time()
-    max_speed = np.zeros_like(last_pos)
-    no_motion_count = 0
-    start_time = last_time
-
-    while True:
-        time.sleep(poll_dt)
-        obs = env.get_observation()
-        cur_pos = np.array(obs["robot_state"]["joint_positions"], dtype=float)
-        now = time.time()
-        dt = max(now - last_time, 1e-6)
-        delta = cur_pos - last_pos
-        speed = np.abs(delta) / dt
-        max_speed = np.maximum(max_speed, speed)
-
-        if np.linalg.norm(delta) < no_motion_threshold:
-            no_motion_count += 1
-        else:
-            no_motion_count = 0
-
-        if np.linalg.norm(target_joint_pos - cur_pos) <= pos_tol:
-            return True, max_speed
-
-        if no_motion_count >= no_motion_max_count:
-            return False, max_speed
-
-        if now - start_time >= total_duration + 1.0:
-            return True, max_speed
-
-        last_pos = cur_pos
-        last_time = now
-
-
-@contextlib.contextmanager
-def prevent_keyboard_interrupt():
-    """
-    临时阻止键盘中断，延迟处理直到受保护的代码执行完毕。
-    用于防止在等待策略服务器响应时被 Ctrl+C 中断导致连接问题。
-    """
-    interrupted = False
-    original_handler = signal.getsignal(signal.SIGINT)
-
-    def handler(signum, frame):
-        nonlocal interrupted
-        interrupted = True
-
-    signal.signal(signal.SIGINT, handler)
-    try:
-        yield
-    finally:
-        signal.signal(signal.SIGINT, original_handler)
-        if interrupted:
-            raise KeyboardInterrupt
 
 
 def main(args: Args):
@@ -514,7 +259,12 @@ def main(args: Args):
                     curr_obs = env.get_observation()
 
                     # 提取观察数据
-                    obs_data = _extract_observation(args, curr_obs, save_to_disk=(t_step == 0))
+                    obs_data = _extract_observation(
+                        curr_obs,
+                        external_camera_serial=args.external_camera_serial,
+                        wrist_camera_serial=args.wrist_camera_serial,
+                        save_to_disk=(t_step == 0),
+                    )
 
                     # 保存外部相机图像用于视频
                     video_frames.append(obs_data["external_image"])
@@ -565,6 +315,7 @@ def main(args: Args):
 
                     # 执行动作（平滑/速度控制 或 直接位置控制）
                     skip_rate_sleep = False
+                    waypoints_total_duration = 0.0
                     target_joint_pos = action[:7]
                     target_gripper_pos = action[-1]
 
@@ -667,6 +418,7 @@ def main(args: Args):
                                     target_joint_pos,
                                     pos_tol=args.no_smooth_inner_loop_pos_tol,
                                     timeout_s=args.no_smooth_inner_loop_timeout_s,
+                                    poll_dt=args.no_smooth_inner_loop_poll_dt,
                                 )
                             _append_control_log(
                                 control_log_entries,
@@ -749,6 +501,7 @@ def main(args: Args):
                                         joint_target,
                                         pos_tol=args.no_smooth_inner_loop_pos_tol,
                                         timeout_s=args.no_smooth_inner_loop_timeout_s,
+                                        poll_dt=args.no_smooth_inner_loop_poll_dt,
                                     )
                                 else:
                                     _sleep_to_rate(sub_step_start, actual_interp_hz)
@@ -778,60 +531,72 @@ def main(args: Args):
 
                         speed_limit = args.waypoints_max_joint_speed
                         accel_limit = args.waypoints_max_joint_accel if args.waypoints_inner_loop else None
-                        joint_targets, durations, gripper_targets = _build_waypoint_trajectory(
-                            chunk_actions,
-                            control_frequency=control_frequency,
-                            inter=args.inter,
-                            max_joint_speed_deg_s=speed_limit,
-                            current_joint_pos=obs_data["joint_position"],
-                            max_joint_accel_deg_s2=accel_limit,
-                        )
-                        if joint_limits_deg is not None and joint_targets.size > 0:
-                            clamped_targets = _clamp_joint_targets_rad(
-                                joint_targets, joint_limits_deg
+                        if args.waypoints_step_to_step:
+                            total_duration = 0.0
+                            segment_start_pos = np.array(
+                                obs_data["joint_position"], dtype=float
                             )
-                            if not np.allclose(clamped_targets, joint_targets):
-                                print("[轨迹] 关节目标超出硬限，已自动 clamp")
-                            joint_targets = clamped_targets
-                        if joint_targets.size == 0:
-                            print("[安全] 轨迹为空，跳过执行")
-                        else:
-                            if safety_monitor is not None:
-                                last_safe_idx = -1
-                                try:
-                                    for idx, joint_target in enumerate(joint_targets):
-                                        if not safety_monitor.check_and_handle(env, joint_target):
-                                            print(
-                                                "[安全] 软急停: 轨迹超界，截断到最后安全点 "
-                                                f"index={last_safe_idx}"
-                                            )
-                                            break
-                                        last_safe_idx = idx
-                                except RuntimeError as exc:
-                                    print(f"[安全] 硬急停: {exc}")
-                                    estop_triggered = True
+                            for seg_idx, seg_action in enumerate(chunk_actions):
+                                seg_chunk = np.asarray([seg_action], dtype=float)
+                                joint_targets, durations, gripper_targets = _build_waypoint_trajectory(
+                                    seg_chunk,
+                                    control_frequency=control_frequency,
+                                    inter=args.inter,
+                                    max_joint_speed_deg_s=speed_limit,
+                                    current_joint_pos=segment_start_pos,
+                                    max_joint_accel_deg_s2=accel_limit,
+                                )
+                                if joint_limits_deg is not None and joint_targets.size > 0:
+                                    clamped_targets = _clamp_joint_targets_rad(
+                                        joint_targets, joint_limits_deg
+                                    )
+                                    if not np.allclose(clamped_targets, joint_targets):
+                                        print("[轨迹] 关节目标超出硬限，已自动 clamp")
+                                    joint_targets = clamped_targets
+                                if joint_targets.size == 0:
+                                    print("[安全] 轨迹为空，跳过执行")
+                                    break
+                                if safety_monitor is not None:
+                                    last_safe_idx = -1
+                                    try:
+                                        for idx, joint_target in enumerate(joint_targets):
+                                            if not safety_monitor.check_and_handle(env, joint_target):
+                                                print(
+                                                    "[安全] 软急停: 轨迹超界，截断到最后安全点 "
+                                                    f"index={last_safe_idx}"
+                                                )
+                                                break
+                                            last_safe_idx = idx
+                                    except RuntimeError as exc:
+                                        print(f"[安全] 硬急停: {exc}")
+                                        estop_triggered = True
 
-                                if not estop_triggered:
-                                    if last_safe_idx < 0:
-                                        print("[安全] 软急停: 轨迹全部超界，跳过执行")
-                                    else:
+                                    if not estop_triggered:
+                                        if last_safe_idx < 0:
+                                            print("[安全] 软急停: 轨迹全部超界，停止执行")
+                                            break
                                         if last_safe_idx < len(joint_targets) - 1:
                                             joint_targets = joint_targets[: last_safe_idx + 1]
                                             durations = durations[: last_safe_idx + 1]
                                             gripper_targets = gripper_targets[: last_safe_idx + 1]
 
-                            if not estop_triggered:
+                                if estop_triggered:
+                                    break
+
                                 print(
-                                    f"[轨迹] waypoints={len(joint_targets)}, "
+                                    f"[轨迹] step={seg_idx + 1}/{len(chunk_actions)}, "
+                                    f"waypoints={len(joint_targets)}, "
                                     f"总时长≈{durations.sum():.2f}s, "
                                     f"speed_limit={speed_limit:.2f} deg/s"
                                 )
-
                                 env._execute_joint_waypoints(
                                     joint_targets,
                                     durations,
                                     blending_radius=0.0,
                                 )
+                                total_duration += float(np.sum(durations))
+                                waypoints_total_duration = total_duration
+
                                 target_gripper_pos = float(gripper_targets[-1])
                                 if abs(target_gripper_pos - env._current_gripper_pos) > 0.1:
                                     env._control_gripper(target_gripper_pos)
@@ -847,29 +612,126 @@ def main(args: Args):
                                         no_motion_max_count=args.waypoints_no_motion_max_count,
                                     )
 
-                        for idx, joint_target in enumerate(joint_targets):
-                            _append_control_log(
-                                control_log_entries,
-                                t_step=t_step,
-                                chunk_index=chunk_index,
-                                action_index=idx,
-                                interp_step=idx + 1,
-                                interp_steps=len(joint_targets),
-                                state={
-                                    "joint_position": obs_data["joint_position"].tolist(),
-                                    "gripper_position": float(obs_data["gripper_position"][0]),
-                                    "cartesian_position": curr_obs["robot_state"]["cartesian_position"].tolist(),
-                                },
-                                action={
-                                    "joint_position": joint_target.tolist(),
-                                    "gripper_position": float(gripper_targets[idx]),
-                                },
-                                mode="waypoints",
-                                timestamp=time.time(),
-                            )
+                                for idx, joint_target in enumerate(joint_targets):
+                                    _append_control_log(
+                                        control_log_entries,
+                                        t_step=t_step,
+                                        chunk_index=chunk_index,
+                                        action_index=seg_idx,
+                                        interp_step=idx + 1,
+                                        interp_steps=len(joint_targets),
+                                        state={
+                                            "joint_position": obs_data["joint_position"].tolist(),
+                                            "gripper_position": float(obs_data["gripper_position"][0]),
+                                            "cartesian_position": curr_obs["robot_state"]["cartesian_position"].tolist(),
+                                        },
+                                        action={
+                                            "joint_position": joint_target.tolist(),
+                                            "gripper_position": float(gripper_targets[idx]),
+                                        },
+                                        mode="waypoints_step",
+                                        timestamp=time.time(),
+                                    )
 
-                        skip_rate_sleep = True
-                        actions_from_chunk_completed = args.open_loop_horizon
+                                segment_start_pos = joint_targets[-1]
+
+                            if not estop_triggered:
+                                skip_rate_sleep = True
+                                actions_from_chunk_completed = args.open_loop_horizon
+                        else:
+                            joint_targets, durations, gripper_targets = _build_waypoint_trajectory(
+                                chunk_actions,
+                                control_frequency=control_frequency,
+                                inter=args.inter,
+                                max_joint_speed_deg_s=speed_limit,
+                                current_joint_pos=obs_data["joint_position"],
+                                max_joint_accel_deg_s2=accel_limit,
+                            )
+                            if joint_limits_deg is not None and joint_targets.size > 0:
+                                clamped_targets = _clamp_joint_targets_rad(
+                                    joint_targets, joint_limits_deg
+                                )
+                                if not np.allclose(clamped_targets, joint_targets):
+                                    print("[轨迹] 关节目标超出硬限，已自动 clamp")
+                                joint_targets = clamped_targets
+                            if joint_targets.size == 0:
+                                print("[安全] 轨迹为空，跳过执行")
+                            else:
+                                if safety_monitor is not None:
+                                    last_safe_idx = -1
+                                    try:
+                                        for idx, joint_target in enumerate(joint_targets):
+                                            if not safety_monitor.check_and_handle(env, joint_target):
+                                                print(
+                                                    "[安全] 软急停: 轨迹超界，截断到最后安全点 "
+                                                    f"index={last_safe_idx}"
+                                                )
+                                                break
+                                            last_safe_idx = idx
+                                    except RuntimeError as exc:
+                                        print(f"[安全] 硬急停: {exc}")
+                                        estop_triggered = True
+
+                                    if not estop_triggered:
+                                        if last_safe_idx < 0:
+                                            print("[安全] 软急停: 轨迹全部超界，跳过执行")
+                                        else:
+                                            if last_safe_idx < len(joint_targets) - 1:
+                                                joint_targets = joint_targets[: last_safe_idx + 1]
+                                                durations = durations[: last_safe_idx + 1]
+                                                gripper_targets = gripper_targets[: last_safe_idx + 1]
+
+                                if not estop_triggered:
+                                    print(
+                                        f"[轨迹] waypoints={len(joint_targets)}, "
+                                        f"总时长≈{durations.sum():.2f}s, "
+                                        f"speed_limit={speed_limit:.2f} deg/s"
+                                    )
+
+                                    env._execute_joint_waypoints(
+                                        joint_targets,
+                                        durations,
+                                        blending_radius=0.0,
+                                    )
+                                    waypoints_total_duration = float(np.sum(durations))
+                                    target_gripper_pos = float(gripper_targets[-1])
+                                    if abs(target_gripper_pos - env._current_gripper_pos) > 0.1:
+                                        env._control_gripper(target_gripper_pos)
+
+                                    if args.waypoints_inner_loop:
+                                        _monitor_waypoints_execution(
+                                            env,
+                                            joint_targets[-1],
+                                            total_duration=float(np.sum(durations)),
+                                            poll_dt=args.waypoints_inner_loop_dt,
+                                            pos_tol=args.waypoints_inner_loop_pos_tol,
+                                            no_motion_threshold=args.waypoints_no_motion_threshold,
+                                            no_motion_max_count=args.waypoints_no_motion_max_count,
+                                        )
+
+                            for idx, joint_target in enumerate(joint_targets):
+                                _append_control_log(
+                                    control_log_entries,
+                                    t_step=t_step,
+                                    chunk_index=chunk_index,
+                                    action_index=idx,
+                                    interp_step=idx + 1,
+                                    interp_steps=len(joint_targets),
+                                    state={
+                                        "joint_position": obs_data["joint_position"].tolist(),
+                                        "gripper_position": float(obs_data["gripper_position"][0]),
+                                        "cartesian_position": curr_obs["robot_state"]["cartesian_position"].tolist(),
+                                    },
+                                    action={
+                                        "joint_position": joint_target.tolist(),
+                                        "gripper_position": float(gripper_targets[idx]),
+                                    },
+                                    mode="waypoints",
+                                    timestamp=time.time(),
+                                )
+
+                            skip_rate_sleep = True
+                            actions_from_chunk_completed = args.open_loop_horizon
 
                     # 获取执行后的关节角度
                     post_obs = env.get_observation()
@@ -887,7 +749,7 @@ def main(args: Args):
                         if elapsed_time < 1 / control_frequency:
                             time.sleep(1 / control_frequency - elapsed_time)
                     else:
-                        remaining = durations.sum() - (time.time() - start_time)
+                        remaining = waypoints_total_duration - (time.time() - start_time)
                         if remaining > 0:
                             time.sleep(remaining)
 
@@ -931,80 +793,6 @@ def main(args: Args):
     finally:
         env.close()
         print("程序结束")
-
-
-def _extract_observation(args: Args, obs_dict: dict, *, save_to_disk: bool = False) -> dict:
-    """
-    从机器人观察中提取所需数据。
-
-    Args:
-        args: 命令行参数
-        obs_dict: KinovaRobotEnv.get_observation() 返回的字典
-        save_to_disk: 是否保存图像到磁盘
-
-    Returns:
-        dict: 提取后的观察数据
-    """
-    image_dict = obs_dict["image"]
-    robot_state = obs_dict["robot_state"]
-
-    # 获取图像（根据相机序列号）
-    external_image = None
-    wrist_image = None
-
-    for key, img in image_dict.items():
-        if args.external_camera_serial and args.external_camera_serial in key:
-            external_image = img
-        elif args.wrist_camera_serial and args.wrist_camera_serial in key:
-            wrist_image = img
-
-    # 如果未通过序列号匹配，尝试按顺序获取
-    if external_image is None or wrist_image is None:
-        images = list(image_dict.values())
-        print(f"len(images): {len(images)}")  
-        if len(images) >= 2:
-            external_image = images[0]
-            wrist_image = images[1]
-        elif len(images) == 1:
-            external_image = images[0]
-            wrist_image = images[0]  # 使用同一图像作为 fallback
-
-    # 提取机器人状态
-    joint_position = np.array(robot_state["joint_positions"])
-    gripper_position = np.array([robot_state["gripper_position"]])
-
-    # 保存组合图像到磁盘
-    if save_to_disk and external_image is not None and wrist_image is not None:
-        # 创建组合图像便于实时查看
-        combined_image = np.concatenate([external_image, wrist_image], axis=1)
-        combined_pil = Image.fromarray(combined_image)
-        combined_pil.save("robot_camera_views.png")
-        print("已保存相机图像到 robot_camera_views.png")
-
-    return {
-        "external_image": external_image,
-        "wrist_image": wrist_image,
-        "joint_position": joint_position,
-        "gripper_position": gripper_position,
-    }
-
-
-def _save_video(frames: list, timestamp: str):
-    """保存视频"""
-    try:
-        from moviepy.editor import ImageSequenceClip
-
-        os.makedirs("videos", exist_ok=True)
-        filename = f"videos/rollout_{timestamp}.mp4"
-        
-        video_array = np.stack(frames)
-        clip = ImageSequenceClip(list(video_array), fps=10)
-        clip.write_videofile(filename, codec="libx264", verbose=False, logger=None)
-        print(f"视频已保存: {filename}")
-    except ImportError:
-        print("moviepy 未安装，跳过视频保存。安装: pip install moviepy")
-    except Exception as e:
-        print(f"保存视频失败: {e}")
 
 
 if __name__ == "__main__":
