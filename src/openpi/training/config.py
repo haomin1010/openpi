@@ -723,18 +723,19 @@ _CONFIGS = [
     # Kinova Gen3 self-collected dataset fine-tuning.
     #
     TrainConfig(
-        name="pi05_kinova_selfcollect",
+        name="pi05_kinova_full_training",
         model=pi0_config.Pi0Config(
             pi05=True,
             action_dim=32,
-            action_horizon=1,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
+            action_horizon=10,
         ),
+
+
         data=SimpleDataConfig(
             repo_id="kinova_gen3_dataset",
-            data_transforms=lambda model: _transforms.Group(inputs=[libero_policy.LiberoInputs(model_type=ModelType.PI05)]),
-            model_transforms=_KinovaModelTransformFactory(),
+            assets=AssetsConfig(asset_id="kinova"),
+            data_transforms=lambda model: _transforms.Group(inputs=[droid_policy.DroidInputs(model_type=ModelType.PI05)]),
+            model_transforms=ModelTransformFactory(),
             base_config=DataConfig(
                 repack_transforms=_transforms.Group(
                     inputs=[
@@ -752,22 +753,21 @@ _CONFIGS = [
                 prompt_from_task=True,
             ),
         ),
+
+
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        freeze_filter=pi0_config.Pi0Config(
-            pi05=True,
-            action_dim=32,
-            action_horizon=1,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ).get_freeze_filter(),
-        ema_decay=None,
-        batch_size=2,
-        num_workers=0,
-        log_interval=1,
-        save_interval=1,
-        wandb_enabled=False,
-        fsdp_devices=1,
-        num_train_steps=1,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=5_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        num_train_steps=100_000,
+        batch_size=64,
+        log_interval=100,
+        save_interval=2000,
+        keep_period=10_000,
+        num_workers=32,
     ),
     TrainConfig(
         # Change the name to reflect your model and dataset.
