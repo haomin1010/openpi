@@ -74,9 +74,15 @@ def main(
                 return
             npz_files = [data_dir]
         else:
-            npz_files = sorted(list(data_dir.glob("*_libero_*.npz")))
+            # 递归搜索指定目录下所有子目录中的 libero_format
+            libero_dirs = sorted([p for p in data_dir.rglob("libero_format") if p.is_dir()])
+            if not libero_dirs:
+                logger.error(f"在 {data_dir} 下未找到 libero_format 目录")
+                return
+            for libero_dir in libero_dirs:
+                npz_files.extend(sorted(libero_dir.glob("*_libero_*.npz")))
             if not npz_files:
-                logger.error(f"在 {data_dir} 中未找到符合 *_libero_*.npz 模式的文件")
+                logger.error(f"在 {data_dir} 下的 libero_format 目录中未找到符合 *_libero_*.npz 模式的文件")
                 return
         
     logger.info(f"找到 {len(npz_files)} 个数据文件")
