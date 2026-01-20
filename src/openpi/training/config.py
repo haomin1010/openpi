@@ -733,8 +733,7 @@ _CONFIGS = [
 
         data=SimpleDataConfig(
             repo_id="kinova_gen3_dataset",
-            assets=AssetsConfig(asset_id="kinova"),
-            data_transforms=lambda model: _transforms.Group(inputs=[droid_policy.DroidInputs(model_type=ModelType.PI05)]),
+            data_transforms=lambda model: _transforms.Group(inputs=[libero_policy.LiberoInputs(model_type=ModelType.PI05)]),
             model_transforms=ModelTransformFactory(),
             base_config=DataConfig(
                 repack_transforms=_transforms.Group(
