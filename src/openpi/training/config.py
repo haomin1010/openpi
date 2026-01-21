@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.kinova_policy as kinova_policy #Import kinova policy, which cut the action and state dimension to 8 for Kinova Gena3
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -733,7 +734,10 @@ _CONFIGS = [
 
         data=SimpleDataConfig(
             repo_id="kinova_gen3_dataset",
-            data_transforms=lambda model: _transforms.Group(inputs=[libero_policy.LiberoInputs(model_type=ModelType.PI05)]),
+            data_transforms=lambda model: _transforms.Group(
+                inputs=[kinova_policy.KinovaInputs(model_type=ModelType.PI05, valid_dim=8)],
+                outputs=[kinova_policy.KinovaOutputs(valid_dim=8)],
+            ),
             model_transforms=ModelTransformFactory(),
             base_config=DataConfig(
                 repack_transforms=_transforms.Group(
@@ -781,7 +785,10 @@ _CONFIGS = [
         ),
         data=SimpleDataConfig(
             repo_id="kinova_gen3_dataset",
-            data_transforms=lambda model: _transforms.Group(inputs=[libero_policy.LiberoInputs(model_type=ModelType.PI05)]),
+            data_transforms=lambda model: _transforms.Group(
+                inputs=[kinova_policy.KinovaInputs(model_type=ModelType.PI05, valid_dim=8)],
+                outputs=[kinova_policy.KinovaOutputs(valid_dim=8)],
+            ),
             model_transforms=_KinovaModelTransformFactory(),
             base_config=DataConfig(
                 repack_transforms=_transforms.Group(
