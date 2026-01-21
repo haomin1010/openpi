@@ -720,7 +720,7 @@ _CONFIGS = [
     # For your own dataset, you can copy this class and modify the dataset name, and data transforms based on
     # the comments below.
     #
-    # Kinova Gen3 self-collected dataset fine-tuning.
+    # Kinova Gen3 self-collected dataset full_training.
     #
     TrainConfig(
         name="pi05_kinova_full_training",
@@ -766,7 +766,56 @@ _CONFIGS = [
         log_interval=100,
         save_interval=2000,
         keep_period=10_000,
-        num_workers=32,
+        num_workers=2,
+    ),
+    # Kinova Gen3 self-collected dataset fine-tuning test.
+    #
+    TrainConfig(
+        name="pi05_kinova_selfcollect",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=1,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=SimpleDataConfig(
+            repo_id="kinova_gen3_dataset",
+            data_transforms=lambda model: _transforms.Group(inputs=[libero_policy.LiberoInputs(model_type=ModelType.PI05)]),
+            model_transforms=_KinovaModelTransformFactory(),
+            base_config=DataConfig(
+                repack_transforms=_transforms.Group(
+                    inputs=[
+                        _transforms.RepackTransform(
+                            {
+                                "observation/image": "image",
+                                "observation/wrist_image": "wrist_image",
+                                "observation/state": "state",
+                                "actions": "actions",
+                                "prompt": "prompt",
+                            }
+                        )
+                    ]
+                ),
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=1,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        batch_size=2,
+        num_workers=0,
+        log_interval=1,
+        save_interval=1,
+        wandb_enabled=False,
+        fsdp_devices=1,
+        num_train_steps=1,
     ),
     TrainConfig(
         # Change the name to reflect your model and dataset.
