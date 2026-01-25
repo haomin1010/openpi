@@ -1,10 +1,14 @@
 cd /home/kinova/qyh/openpi_kinova/openpi
 source .venv/bin/activate
 export CUDA_VISIBLE_DEVICES=1
+
+#pi05 base
 python scripts/serve_policy.py --port 8000 policy:checkpoint \
   --policy.config=pi05_kinova \
-  --policy.dir=gs://openpi-assets/checkpoints/pi05_base \
+  --policy.dir=gs://openpi-assets/checkpoints/pi05_base 
 
+#pi05 finetuning
+python examples/kinova_gen3/main.py   --remote-host 127.0.0.1   --remote-port 8000   --robot-ip 192.168.1.10 --no-safety --control-mode no_smooth --no-smooth-inner-loop --external-camera-serial  "406122070121" --wrist-camera-serial "401622070466"
 
 cd /home/kinova/qyh/openpi_kinova/openpi/examples/kinova_gen3
 source ../../.venv/bin/activate  # 或者使用 examples/kinova_gen3/.venv
@@ -13,10 +17,10 @@ python main.py \
   --remote-port 8000 \
   --robot-ip 192.168.1.10 \
   --gripper-ip 192.168.1.43 \
-  --external-serial <外部相机序列号> \
-  --wrist-serial <腕部相机序列号>
+  --external-serial  406122072121\
+  --wrist-serial 401622070466
 
-python examples/kinova_gen3/main.py   --remote-host 127.0.0.1   --remote-port 8000   --robot-ip 192.168.1.10 --no-safety --control-mode no_smooth --no-smooth-inner-loop 
+python examples/kinova_gen3/main.py   --remote-host 127.0.0.1   --remote-port 8000   --robot-ip 192.168.1.10 --no-safety --control-mode no_smooth --no-smooth-inner-loop --external-serial  406122072121 --wrist-serial 401622070466
 
 python examples/kinova_gen3/main.py   --remote-host 127.0.0.1   --remote-port 8000   --robot-ip 192.168.1.10 --control-mode waypoints --waypoints-inner-loop --no-safety --control-freq 1
 
