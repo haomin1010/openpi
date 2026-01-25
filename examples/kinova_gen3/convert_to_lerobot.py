@@ -33,6 +33,7 @@ def main(
     data_dir: Optional[Path] = None,
     repo_name: str = "kinova_gen3_dataset",
     fps: Optional[int] = None,
+    freq: int = 5,
     prompt: Optional[str] = "Grab the target object",
     force_override: bool = False,
     push_to_hub: bool = False,
@@ -44,6 +45,7 @@ def main(
     Args:
         data_dir: 指定要转换的目录或文件；为空时自动搜索 data/**/libero_format
         repo_name: 输出数据集的名称 (HF_LEROBOT_HOME/repo_name)
+        freq: 下采样步长（每隔 freq 帧保留一帧）；动作会根据下采样后的状态重新计算
         prompt: 统一设置数据集的任务指令；为 None 时使用 npz 内的 task 字段
         force_override: 是否覆盖已存在的输出数据集
         push_to_hub: 是否上传到 Hugging Face Hub
@@ -87,6 +89,11 @@ def main(
         
     logger.info(f"找到 {len(npz_files)} 个数据文件")
 
+    if freq <= 0:
+        logger.error("freq 必须为正整数")
+        return
+    sample_stride = int(freq)
+
     # 2. 准备输出路径
     if hub_username:
         full_repo_id = f"{hub_username}/{repo_name}"
@@ -114,7 +121,10 @@ def main(
         # 推断失败则保持默认 30Hz
         pass
 
-    dataset_fps = int(fps) if fps is not None else inferred_fps
+    if fps is not None:
+        dataset_fps = int(fps)
+    else:
+        dataset_fps = max(1, int(round(inferred_fps / sample_stride)))
 
     # 4. 创建 LeRobot 数据集
     # 定义特征结构，与 collect_data.py 中的保存格式对应
@@ -166,11 +176,23 @@ def main(
             agent_images = data['agent_images']
             wrist_images = data['wrist_images']
             states = data['states']
-            actions = data['actions']
             task = prompt if prompt is not None else str(data['task'])
             
+            # 下采样：每隔 sample_stride 帧取一帧
+            if sample_stride > 1:
+                indices = np.arange(0, len(states), sample_stride)
+                agent_images = agent_images[indices]
+                wrist_images = wrist_images[indices]
+                states = states[indices]
+
+            states = np.asarray(states, dtype=np.float32)
             num_frames = len(states)
             total_frames += num_frames
+
+            # 根据下采样后的状态重新计算动作（相邻状态差分）
+            actions = np.zeros_like(states, dtype=np.float32)
+            if num_frames > 1:
+                actions[:-1] = states[1:] - states[:-1]
             
             for i in range(num_frames):
                 state = np.asarray(states[i], dtype=np.float32)

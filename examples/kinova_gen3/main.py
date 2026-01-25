@@ -114,7 +114,7 @@ class Args:
     # 在每两个动作点之间插入的中间点数量（0 表示不插值）
     inter: int = 0
     no_smooth_inner_loop: bool = False
-    no_smooth_inner_loop_pos_tol: float = 0.01
+    no_smooth_inner_loop_pos_tol: float = 0.001
     no_smooth_inner_loop_timeout_s: float = 2.0
     no_smooth_inner_loop_poll_dt: float = 0.02
 
@@ -268,22 +268,34 @@ def main(args: Args):
 
                     # 保存外部相机图像用于视频
                     video_frames.append(obs_data["external_image"])
-
+                    print(f"step={actions_from_chunk_completed}")
                     # 如果需要，查询策略服务器获取新的动作 chunk
                     if actions_from_chunk_completed == 0 or actions_from_chunk_completed >= args.open_loop_horizon:
+
                         actions_from_chunk_completed = 0
                         chunk_index += 1
 
+
                         # 准备请求数据（图像需要 resize 到 224x224）
+                        base_image = image_tools.resize_with_pad(
+                            obs_data["external_image"], 224, 224
+                        )
+                        wrist_image = image_tools.resize_with_pad(
+                            obs_data["wrist_image"], 224, 224
+                        )
+                        # 同时兼容 DROID 与 Kinova policy 的输入键名
                         request_data = {
-                            "observation/exterior_image_1_left": image_tools.resize_with_pad(
-                                obs_data["external_image"], 224, 224
-                            ),
-                            "observation/wrist_image_left": image_tools.resize_with_pad(
-                                obs_data["wrist_image"], 224, 224
-                            ),
+                            # DROID 风格输入
+                            "observation/exterior_image_1_left": base_image,
+                            "observation/wrist_image_left": wrist_image,
                             "observation/joint_position": obs_data["joint_position"],
                             "observation/gripper_position": obs_data["gripper_position"],
+                            # Kinova 自采集风格输入
+                            "observation/image": base_image,
+                            "observation/wrist_image": wrist_image,
+                            "observation/state": np.concatenate(
+                                [obs_data["joint_position"], obs_data["gripper_position"]]
+                            ),
                             "prompt": instruction,
                         }
 
@@ -299,7 +311,6 @@ def main(args: Args):
                     action_index_in_chunk = actions_from_chunk_completed
                     action = pred_action_chunk[action_index_in_chunk]
                     actions_from_chunk_completed += 1
-
                     # 二值化夹爪动作
                     if action[-1] > 0.5:
                         action = np.concatenate([action[:-1], np.ones((1,))])
@@ -307,11 +318,12 @@ def main(args: Args):
                         action = np.concatenate([action[:-1], np.zeros((1,))])
 
                     # 打印执行前的 action
-                    joint_angles_str = ", ".join([f"{x:.4f}" for x in action[:7]])
-                    gripper_str = f"{action[-1]:.4f}"
-                    print(f"\n[t={t_step}] 执行 Action:")
-                    print(f"  关节角度: [{joint_angles_str}]")
-                    print(f"  夹爪位置: {gripper_str}")
+                    joint_angles_str = ", ".join([f"{x:.6f}" for x in action[:7]])
+                    gripper_str = f"{action[-1]:.6f}"
+                    if t_step % 8 == 0 or t_step % 8 == 7:
+                        print(f"\n[t={t_step}] 执行 Action:")
+                        print(f"  关节角度: [{joint_angles_str}]")
+                        print(f"  夹爪位置: {gripper_str}")
 
                     # 执行动作（平滑/速度控制 或 直接位置控制）
                     skip_rate_sleep = False
@@ -739,9 +751,10 @@ def main(args: Args):
                     post_gripper_position = post_obs["robot_state"]["gripper_position"]
                     
                     # 打印执行后的关节角度
-                    post_joint_angles_str = ", ".join([f"{x:.4f}" for x in post_joint_positions])
+                    post_joint_angles_str = ", ".join([f"{x:.6f}" for x in post_joint_positions])
+                    #if t_step % 8 == 0 or t_step % 8 == 7:
                     print(f"  执行后关节角度: [{post_joint_angles_str}]")
-                    print(f"  执行后夹爪位置: {post_gripper_position:.4f}")
+                    print(f"  执行后夹爪位置: {post_gripper_position:.6f}")
 
                     # 等待以匹配控制频率
                     elapsed_time = time.time() - start_time

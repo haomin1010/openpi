@@ -736,7 +736,11 @@ _CONFIGS = [
             repo_id="kinova_gen3_dataset",
             data_transforms=lambda model: _transforms.Group(
                 inputs=[kinova_policy.KinovaInputs(model_type=ModelType.PI05, valid_dim=8)],
-                outputs=[kinova_policy.KinovaOutputs(valid_dim=8)],
+                outputs=[
+                    # Convert delta joint actions to absolute positions (gripper stays absolute).
+                    _transforms.AbsoluteActions(_transforms.make_bool_mask(7, -1)),
+                    kinova_policy.KinovaOutputs(valid_dim=8),
+                ],
             ),
             model_transforms=ModelTransformFactory(),
             base_config=DataConfig(
@@ -766,7 +770,7 @@ _CONFIGS = [
             decay_lr=5e-5,
         ),
         num_train_steps=100_000,
-        batch_size=64,
+        batch_size=2,
         log_interval=100,
         save_interval=2000,
         keep_period=10_000,
