@@ -8,6 +8,9 @@ python scripts/serve_policy.py --port 8000 policy:checkpoint \
   --policy.dir=gs://openpi-assets/checkpoints/pi05_base 
 
 #pi05 finetuning
+python scripts/serve_policy.py --port 8000 policy:checkpoint   --policy.config=pi05_kinova_full_training   --policy.dir=/home/kinova/qyh/openpi_kinova/openpi/checkpoints/pi05_kinova_full_training/smoke_test_2/9999
+
+
 python examples/kinova_gen3/main.py   --remote-host 127.0.0.1   --remote-port 8000   --robot-ip 192.168.1.10 --no-safety --control-mode no_smooth --no-smooth-inner-loop --external-camera-serial  "406122070121" --wrist-camera-serial "401622070466"
 
 cd /home/kinova/qyh/openpi_kinova/openpi/examples/kinova_gen3
