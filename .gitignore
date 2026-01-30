@@ -174,3 +174,4 @@ examples/kinova_gen3/*error*.txt
 videos
 *.png
 logs
+*.out
