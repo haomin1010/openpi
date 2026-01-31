@@ -56,39 +56,70 @@ def load_log_file(log_path: Path) -> list[dict]:
         return []
 
 
-def extract_trajectory_from_log(log_entries: list[dict], kinematics: URDFKinematics,
-                                use_state: bool = True) -> np.ndarray:
+def _coerce_joint_array(value) -> np.ndarray | None:
+    if isinstance(value, (list, tuple, np.ndarray)) and len(value) >= 7:
+        return np.array(value[:7], dtype=float)
+    return None
+
+
+def _get_status_joint_positions(entry: dict) -> np.ndarray | None:
+    status = entry.get('status') or entry.get('state')
+    if isinstance(status, dict):
+        joint_positions = status.get('joint_position')
+        return _coerce_joint_array(joint_positions)
+    return _coerce_joint_array(status)
+
+
+def _get_action_joint_deltas(entry: dict) -> np.ndarray | None:
+    action = entry.get('actions') or entry.get('action')
+    if isinstance(action, dict):
+        joint_positions = action.get('joint_position')
+        return _coerce_joint_array(joint_positions)
+    return _coerce_joint_array(action)
+
+
+def extract_trajectory_from_log(
+    log_entries: list[dict],
+    kinematics: URDFKinematics,
+    use_actions: bool = False
+) -> np.ndarray:
     """
     Extract the end-effector trajectory from log entries.
 
     Args:
         log_entries: parsed log entries.
         kinematics: URDFKinematics instance.
-        use_state: use state.joint_position when True; otherwise use action.joint_position.
+        use_actions: when True, use action absolute joint positions.
+            When False, use per-step status.joint_position.
 
     Returns:
         (T, 3) numpy array of end-effector positions.
     """
-    trajectories = []
-    field_name = 'state' if use_state else 'action'
-    
+    trajectories: list[np.ndarray] = []
+    if not use_actions:
+        for entry in log_entries:
+            try:
+                joint_positions = _get_status_joint_positions(entry)
+                if joint_positions is None:
+                    continue
+                _, eef_position = kinematics.compute_joint_positions(joint_positions)
+                trajectories.append(eef_position)
+            except Exception as e:
+                logger.debug(f"Skipping entry: {e}")
+                continue
+        return np.array(trajectories) if trajectories else np.array([]).reshape(0, 3)
+
     for entry in log_entries:
         try:
-            if field_name not in entry:
+            joint_positions = _get_action_joint_deltas(entry)
+            if joint_positions is None:
                 continue
-            
-            joint_positions = entry[field_name].get('joint_position')
-            if joint_positions is None or len(joint_positions) < 7:
-                continue
-            
-            # Extract the first 7 joint angles.
-            joint_angles = joint_positions[:7]
-            _, eef_position = kinematics.compute_joint_positions(joint_angles)
+            _, eef_position = kinematics.compute_joint_positions(joint_positions)
             trajectories.append(eef_position)
         except Exception as e:
             logger.debug(f"Skipping entry: {e}")
             continue
-    
+
     return np.array(trajectories) if trajectories else np.array([]).reshape(0, 3)
 
 
@@ -274,6 +305,9 @@ Examples:
 
   # generate per-log plots and show stats
   python visualize_trajectories_from_logs.py --max-logs 3 --separate-plots --show-stats
+
+  # use absolute joint positions from actions
+  python visualize_trajectories_from_logs.py --use-actions
         """
     )
     
@@ -324,9 +358,10 @@ Examples:
         help='Display trajectory statistics'
     )
     parser.add_argument(
-        '--use-action',
+        '--use-actions',
+        '--use_actions',
         action='store_true',
-        help='Use action.joint_position instead of state.joint_position'
+        help='Use absolute action joint positions to build the trajectory'
     )
     
     args = parser.parse_args()
@@ -382,8 +417,10 @@ Examples:
     log_labels = []
     all_stats = []
     
-    use_field = 'action' if args.use_action else 'state'
-    logger.info(f"Using field: {use_field}.joint_position")
+    if args.use_actions:
+        logger.info("Using per-step action.joint_position (absolute)")
+    else:
+        logger.info("Using per-step status.joint_position")
     
     for idx, log_file in enumerate(log_files):
         logger.info(f"Processing log {idx + 1}/{len(log_files)}: {log_file.name}")
@@ -399,7 +436,7 @@ Examples:
         # Compute end-effector trajectory.
         try:
             trajectory = extract_trajectory_from_log(
-                log_entries, kinematics, use_state=not args.use_action
+                log_entries, kinematics, use_actions=args.use_actions
             )
             
             if len(trajectory) == 0:
